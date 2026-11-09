@@ -317,6 +317,7 @@ function renderTrackButton(quest) {
 //  TAB SWITCHING
 // ══════════════════════════════════════════════════════════════
 function switchTab(tab, btnElement) {
+  flushSketchMetadataSave();
   resetPortraitInspection();
   currentTab = tab;
   currentSpreadPage = 0;
@@ -354,8 +355,9 @@ function saveFieldNotes() {
 }
 
 function saveJournalState() {
-  if (typeof window.saveJournalUserData !== 'function') return;
-  const sketchMetadata = {};
+  // Merge into the cached native metadata so entries for screenshots not currently
+  // listed are kept, and later screenshot reloads re-apply the latest titles.
+  const sketchMetadata = nativeSketchMetadata;
   sketches.forEach(sketch => {
     sketchMetadata[sketch.id] = {
       title: sketch.title || '',
@@ -364,6 +366,7 @@ function saveJournalState() {
       inkSet: Boolean(sketch.inkSet)
     };
   });
+  if (typeof window.saveJournalUserData !== 'function') return;
   window.saveJournalUserData(JSON.stringify({ fieldNotes, sketchMetadata }));
 }
 
@@ -490,6 +493,7 @@ function renderSelectedSketch() {
 function changeSketch(direction) {
   const next = currentSketchIndex + direction;
   if (next < 0 || next >= sketches.length) return;
+  flushSketchMetadataSave();
   resetPortraitInspection();
   currentSketchIndex = next;
   if (currentView === 'sketches') {
@@ -553,7 +557,22 @@ function resetPortraitInspection() {
   triggerSkyrimSound('focus');
 }
 
+const SKETCH_TITLE_SAVE_DELAY_MS = 400;
+let sketchTitleSaveTimer = null;
+
+function scheduleSketchMetadataSave() {
+  clearTimeout(sketchTitleSaveTimer);
+  sketchTitleSaveTimer = setTimeout(saveSketchMetadata, SKETCH_TITLE_SAVE_DELAY_MS);
+}
+
+function flushSketchMetadataSave() {
+  if (sketchTitleSaveTimer === null) return;
+  saveSketchMetadata();
+}
+
 function saveSketchMetadata() {
+  clearTimeout(sketchTitleSaveTimer);
+  sketchTitleSaveTimer = null;
   const metadata = {};
   sketches.forEach(sketch => {
     metadata[sketch.id] = {
@@ -597,6 +616,15 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!sketch) return;
     sketch.title = el.sketchTitle.value;
     el.sketchDetailTitle.textContent = sketch.title || `Portrait ${currentSketchIndex + 1}`;
+    scheduleSketchMetadataSave();
+  });
+  el.sketchTitle.addEventListener('blur', flushSketchMetadataSave);
+  el.sketchTitle.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      flushSketchMetadataSave();
+      el.sketchTitle.blur();
+    }
   });
   el.sketchCaption.addEventListener('input', () => {
     const sketch = sketches[currentSketchIndex];
@@ -670,6 +698,7 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     if (currentView === 'sketch-detail') {
+      flushSketchMetadataSave();
       currentView = 'sketches';
       currentSketchSpreadPage = Math.floor(currentSketchIndex / SKETCHES_PER_SPREAD);
       renderSketchGallery();
@@ -771,12 +800,17 @@ document.addEventListener('DOMContentLoaded', () => {
   function notifyTypingState(active) {
     if (typeof window.setTypingState === 'function') window.setTypingState(active);
   }
-  document.addEventListener('focusin',  (e) => { if (e.target.matches('input, textarea')) notifyTypingState(true); });
-  document.addEventListener('focusout', (e) => { if (e.target.matches('input, textarea')) notifyTypingState(false); });
-  document.addEventListener('keydown',  (e) => {
-    if ((e.key === 'Escape' || (e.key === 'Enter' && !e.shiftKey)) && e.target.matches('input, textarea')) {
-      notifyTypingState(false);
-    }
+  function isTextInput(element) {
+    return element instanceof Element && element.matches('input, textarea');
+  }
+  function updateTypingState() {
+    notifyTypingState(isTextInput(document.activeElement));
+  }
+  document.addEventListener('focusin', (e) => {
+    if (isTextInput(e.target)) updateTypingState();
+  });
+  document.addEventListener('focusout', (e) => {
+    if (isTextInput(e.target)) setTimeout(updateTypingState, 0);
   });
 
   // Initial render
@@ -794,7 +828,7 @@ window.onJournalOpen  = () => {
     window.requestJournalUserData();
   }
 };  // sound played by C++
-window.onJournalClose = () => {};  // sound played by C++
+window.onJournalClose = () => { flushSketchMetadataSave(); };  // sound played by C++
 
 // C++ pushes fresh quest data via this function every time the journal opens
 // or a quest stage event fires.
@@ -869,6 +903,7 @@ window.loadNativeUserData = (data) => {
 
 // C++ screenshot paths for sketches tab
 window.loadScreenshotsFromSkyrim = (fileList) => {
+  flushSketchMetadataSave();
   try {
     const parsed = typeof fileList === 'string' ? JSON.parse(fileList) : fileList;
     const incoming = Array.isArray(parsed) ? parsed : Array.from(parsed || []);
