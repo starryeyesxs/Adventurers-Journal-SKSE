@@ -1,0 +1,766 @@
+﻿/* ============================================================
+   Adventurer's Journal — styles.css  (1.6.3)
+   True two-page book spread
+   ============================================================ */
+
+@font-face {
+  font-family: 'Caveat';
+  font-style: normal; font-weight: 400; font-display: swap;
+  src: url('fonts/Caveat/static/Caveat-Regular.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'Caveat';
+  font-style: normal; font-weight: 500; font-display: swap;
+  src: url('fonts/Caveat/static/Caveat-Medium.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'Caveat';
+  font-style: normal; font-weight: 600; font-display: swap;
+  src: url('fonts/Caveat/static/Caveat-SemiBold.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'Caveat';
+  font-style: normal; font-weight: 700; font-display: swap;
+  src: url('fonts/Caveat/static/Caveat-Bold.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'Cinzel';
+  font-style: normal; font-weight: 500; font-display: swap;
+  src: url('fonts/Cinzel/static/Cinzel-Medium.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'Cinzel';
+  font-style: normal; font-weight: 600; font-display: swap;
+  src: url('fonts/Cinzel/static/Cinzel-SemiBold.ttf') format('truetype');
+}
+@font-face {
+  font-family: 'Cinzel';
+  font-style: normal; font-weight: 700; font-display: swap;
+  src: url('fonts/Cinzel/static/Cinzel-Bold.ttf') format('truetype');
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+
+html, body {
+  background: transparent !important;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  font-family: 'Caveat', cursive;
+  overflow: hidden;
+}
+
+.texture-definitions { height: 0; position: absolute; width: 0; }
+
+/* ── Journal wrapper — leaves room for the bookmark tabs ── */
+.journal-wrapper {
+  position: relative;
+  width: 860px;
+  max-width: calc(100vw - 170px);
+  height: 640px;
+  overflow: visible;
+  pointer-events: auto;
+  margin-right: 145px;
+}
+
+/* ── Bookmark tabs — attached to the cover while remaining inside the viewport ── */
+.bookmark-tabs {
+  position: absolute;
+  top: 45px;
+  right: -145px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 145px;
+  z-index: 100;
+  pointer-events: auto !important;
+}
+
+.tab {
+  background: #65433c;
+  color: #ead9bd;
+  border: 1px dashed rgba(216,184,145,0.42);
+  border-left: 0;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Caveat', cursive;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  line-height: 1.1;
+  cursor: pointer;
+  border-radius: 0 6px 6px 0;
+  box-shadow: inset 12px 0 12px rgba(36,20,15,0.46), 4px 4px 10px rgba(0,0,0,0.54);
+  transition: background 0.2s;
+  text-align: center;
+  width: 145px;
+  white-space: nowrap;
+  pointer-events: auto !important;
+}
+.tab:hover  { background: #765149; }
+.tab.active {
+  background: #986153;
+  color: #fff8e7;
+  box-shadow: inset 12px 0 12px rgba(48,24,17,0.38), inset 0 1px 0 rgba(255,226,187,0.5), 4px 4px 10px rgba(0,0,0,0.54);
+}
+
+/* ── Leather cover ── */
+.book-cover {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, #2c1b12 0%, #1a0f0a 100%);
+  border-radius: 12px;
+  padding: 18px;
+  display: flex;
+  box-shadow: 0 25px 60px rgba(0,0,0,0.9), inset 0 0 15px rgba(0,0,0,0.8);
+  border: 3px solid #140b07;
+  overflow: hidden;
+}
+.book-cover::before {
+  border: 1px solid rgba(133,91,57,0.38);
+  border-radius: 8px;
+  box-shadow: inset 0 0 18px rgba(0,0,0,0.45);
+  content: "";
+  inset: 7px;
+  pointer-events: none;
+  position: absolute;
+  z-index: 0;
+}
+
+/* ── Parchment pages ── */
+.page {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  background-color: #e0cba5;
+  background-image:
+    radial-gradient(ellipse at 18% 12%, rgba(116,72,32,0.2) 0%, rgba(116,72,32,0.07) 16%, transparent 34%),
+    radial-gradient(ellipse at 82% 28%, rgba(255,247,220,0.38) 0%, transparent 26%),
+    radial-gradient(ellipse at 42% 88%, rgba(116,72,32,0.15) 0%, transparent 30%),
+    radial-gradient(circle at center, #f8efd9 0%, #e5d2ad 72%, #cfb98d 100%);
+  padding: 32px 36px 54px;
+  color: #2b1d12;
+  overflow: hidden;
+}
+.page::before {
+  background: rgba(83,53,26,0.22);
+  content: "";
+  filter: url(#paper-noise);
+  inset: 0;
+  mix-blend-mode: multiply;
+  opacity: 0.34;
+  pointer-events: none;
+  position: absolute;
+  z-index: 0;
+}
+.page > * { position: relative; z-index: 1; }
+
+.left-page {
+  border-radius: 6px 2px 2px 6px;
+  box-shadow: inset -10px 0 18px rgba(57,34,19,0.2), inset 0 0 30px rgba(84,56,28,0.35);
+}
+.right-page {
+  border-radius: 2px 6px 6px 2px;
+  box-shadow: inset 10px 0 18px rgba(57,34,19,0.2), inset 0 0 30px rgba(84,56,28,0.35);
+  z-index: 2;
+  overflow: visible;
+}
+
+/* ── Spine ── */
+.spine-crease {
+  width: 24px;
+  flex: 0 0 24px;
+  background: linear-gradient(to right, rgba(43,29,18,0.15) 0%, rgba(20,12,6,0.65) 50%, rgba(43,29,18,0.15) 100%);
+  box-shadow: inset 0 0 10px rgba(0,0,0,0.6), 0 0 3px rgba(0,0,0,0.5);
+  position: relative;
+  z-index: 3;
+}
+
+/* ── Spread panels ── */
+.spread-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.spread-panel.hidden { display: none; }
+
+/* ── Typography ── */
+.page-header, .entry-title {
+  font-family: 'Cinzel', serif;
+  color: #3b1c0e;
+  font-size: 22px;
+  letter-spacing: 0.5px;
+}
+.page-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 2px;
+}
+.eyebrow {
+  color: #80654b;
+  font-family: 'Cinzel', serif;
+  font-size: 10px;
+  letter-spacing: 1.8px;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+.quest-count, .quest-count-right {
+  border: 1px solid rgba(107,76,53,0.5);
+  border-radius: 50%;
+  color: #752222;
+  display: grid;
+  font-family: 'Cinzel', serif;
+  font-size: 14px;
+  height: 30px;
+  place-items: center;
+  min-width: 30px;
+  flex: 0 0 auto;
+}
+.active-list-actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+.untrack-all-btn {
+  background: transparent;
+  border: 1px dashed rgba(107,76,53,0.5);
+  border-radius: 3px;
+  color: #6b4c35;
+  cursor: pointer;
+  font-family: 'Caveat', cursive;
+  font-size: 15px;
+  padding: 4px 8px;
+  transition: background 0.2s, color 0.2s, opacity 0.2s;
+}
+.untrack-all-btn:hover:not(:disabled) {
+  background: rgba(107,76,53,0.12);
+  color: #3b1c0e;
+}
+.untrack-all-btn:disabled {
+  cursor: default;
+  opacity: 0.32;
+}
+.entry-date {
+  font-size: 18px;
+  color: #6b4c35;
+  margin-top: 2px;
+}
+.divider {
+  height: 2px;
+  background: linear-gradient(to right, transparent, #6b4c35, transparent);
+  margin: 12px 0 16px;
+  opacity: 0.6;
+  flex-shrink: 0;
+}
+
+/* ── Quest list ── */
+.quest-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  overflow: hidden;
+}
+.quest-item {
+  font-family: 'Cinzel', serif;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 7px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+  border-bottom: 1px dashed rgba(107,76,53,0.3);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+.quest-item:hover { background: rgba(107,76,53,0.15); transform: translateX(3px); }
+.quest-item.selected {
+  background: rgba(138,40,40,0.18);
+  color: #5c1919;
+  border-left: 3px solid #752222;
+}
+.quest-item.tracked .quest-mark::after { content: ' ✦'; color: #752222; font-size: 10px; }
+.quest-mark {
+  color: #94785a;
+  font-family: 'Caveat', cursive;
+  font-size: 15px;
+  flex: 0 0 auto;
+}
+.empty-state {
+  color: #80654b;
+  font-size: 20px;
+  line-height: 1.3;
+  padding: 16px 8px;
+}
+
+/* ── Quest detail — narrative ── */
+.entry-body {
+  font-size: 24px;
+  line-height: 1.4;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── Track quest button ── */
+.track-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 20px;
+  background: rgba(107,76,53,0.1);
+  border: 1px dashed rgba(107,76,53,0.5);
+  border-radius: 4px;
+  padding: 10px 16px;
+  cursor: pointer;
+  color: #5c3a25;
+  font-family: 'Cinzel', serif;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+.track-btn:hover { background: rgba(138,40,40,0.15); }
+.track-btn.is-tracked {
+  background: rgba(138,40,40,0.18);
+  border-color: #752222;
+  color: #5c1919;
+}
+.track-seal {
+  font-size: 20px;
+  line-height: 1;
+  color: #752222;
+}
+
+/* ── Objectives ── */
+.objectives-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  overflow: hidden;
+}
+.objectives-list li {
+  font-size: 22px;
+  padding-left: 22px;
+  position: relative;
+  line-height: 1.3;
+}
+.objectives-list li::before {
+  content: "•";
+  position: absolute;
+  left: 4px;
+  color: #752222;
+}
+.objectives-list li.done { text-decoration: line-through; opacity: 0.55; }
+
+/* ── Page navigation ── */
+
+/* Next-page curl — bottom-right corner (unchanged) */
+.page-turn {
+  align-items: flex-end;
+  background: linear-gradient(135deg, #c9ab7d 0%, #a88457 100%);
+  border: 0;
+  bottom: 0;
+  clip-path: polygon(100% 0, 100% 100%, 0 100%);
+  color: #5c3a25;
+  cursor: pointer;
+  display: flex;
+  font-family: 'Cinzel', serif;
+  font-size: 20px;
+  height: 64px;
+  justify-content: flex-end;
+  padding: 0 10px 8px 0;
+  position: absolute;
+  right: 0;
+  width: 64px;
+  z-index: 50;
+  pointer-events: auto !important;
+}
+.page-turn::before {
+  border-bottom: 1px solid rgba(71,43,26,0.45);
+  border-left: 1px solid rgba(71,43,26,0.28);
+  bottom: 9px;
+  content: "";
+  height: 44px;
+  position: absolute;
+  right: 9px;
+  transform: skew(-2deg,-2deg);
+  width: 44px;
+}
+.page-turn:hover { background: linear-gradient(135deg, #d6bb8f 0%, #b89262 100%); }
+
+/* Back arrow — flat, no curl */
+.page-back {
+  background: transparent;
+  border: 0;
+  bottom: 12px;
+  clip-path: none;
+  color: rgba(107,76,53,0.7);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  height: 36px;
+  left: 10px;
+  position: absolute;
+  width: 36px;
+  z-index: 50;
+  pointer-events: auto !important;
+}
+.page-back:hover { color: #5c3a25; }
+
+.hidden { display: none; }
+
+/* ── Close hint ── */
+.close-hint {
+  bottom: 14px;
+  color: #5c3a25;
+  font-family: 'Cinzel', serif;
+  font-size: 10px;
+  letter-spacing: 1px;
+  position: absolute;
+  right: 76px;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+.close-hint span { color: #765a3e; margin-left: 4px; }
+
+/* ── Field notes ── */
+.field-note-label { display: flex; flex-direction: column; min-width: 0; }
+.field-note-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.field-note-date {
+  color: #80654b;
+  font-family: 'Caveat', cursive;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1.1;
+  margin-top: 1px;
+}
+#personal-notes {
+  width: 100%;
+  flex: 1;
+  background: transparent;
+  border: none;
+  resize: none;
+  font-family: 'Caveat', cursive;
+  font-size: 25px;
+  line-height: 1.35;
+  color: #2b1d12;
+  outline: none;
+  user-select: text;
+  overflow: hidden;
+  min-height: 300px;
+}
+#personal-notes::placeholder { color: rgba(43,29,18,0.4); }
+
+.new-note-btn {
+  align-self: flex-start;
+  background: rgba(107,76,53,0.1);
+  border: 1px dashed rgba(107,76,53,0.5);
+  border-radius: 4px;
+  color: #5c3a25;
+  cursor: pointer;
+  font-family: 'Cinzel', serif;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  margin-top: auto;
+  padding: 8px 14px;
+  transition: background 0.2s;
+}
+.new-note-btn:hover { background: rgba(138,40,40,0.15); }
+
+/* ── Sketches ── */
+.sketch-list {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0,1fr));
+  flex: 1;
+  min-height: 0;
+}
+.sketch-thumb {
+  background: rgba(107,76,53,0.1);
+  border: 1px solid rgba(107,76,53,0.5);
+  color: #5c3a25;
+  cursor: pointer;
+  padding: 4px;
+  text-align: left;
+  transition: background 0.2s, transform 0.2s;
+}
+.sketch-thumb:hover, .sketch-thumb.selected {
+  background: rgba(138,40,40,0.2);
+  border-color: #752222;
+  transform: translateY(-2px);
+}
+.sketch-thumb img {
+  aspect-ratio: 1.35;
+  display: block;
+  filter: sepia(0.65) saturate(0.55) contrast(1.05);
+  object-fit: cover;
+  width: 100%;
+}
+.sketch-thumb span {
+  display: block;
+  font-family: 'Caveat', cursive;
+  font-size: 15px;
+  line-height: 1.05;
+  margin: 5px 2px 2px;
+}
+.sketch-full-stage,
+.sketch-detail-stage {
+  align-items: center;
+  background: rgba(107,76,53,0.08);
+  border: 1px solid rgba(107,76,53,0.3);
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  min-height: 0;
+  overflow: hidden;
+  padding: 10px;
+}
+.sketch-full-stage {
+  aspect-ratio: 16 / 9;
+  align-self: center;
+  flex: 0 0 auto;
+  height: auto;
+  margin-block: auto;
+  min-height: 0;
+  padding: 4px;
+  width: 100%;
+}
+.sketch-full-stage #sketch-image {
+  cursor: zoom-in;
+}
+.sketch-full-stage img,
+.sketch-detail-stage img {
+  max-height: 100%;
+  max-width: 100%;
+  object-fit: contain;
+}
+.sketch-detail-stage { height: 390px; flex: 0 0 auto; }
+.sketch-filter-btn {
+  background: transparent;
+  border: 1px dashed rgba(107,76,53,0.5);
+  color: #5c3a25;
+  cursor: pointer;
+  font-family: 'Caveat', cursive;
+  font-size: 17px;
+}
+.sketch-status {
+  color: #80654b;
+  font-family: 'Caveat', cursive;
+  font-size: 23px;
+  left: 0;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+  text-align: center;
+  top: 56%;
+}
+.charcoal-sketch {
+  filter: grayscale(1) sepia(0.35) contrast(1.25) brightness(0.9);
+}
+.sketch-stage {
+  align-items: center;
+  background: rgba(107,76,53,0.08);
+  border: 1px solid rgba(107,76,53,0.3);
+  display: flex;
+  height: 340px;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
+  flex-shrink: 0;
+}
+.sketch-stage::after {
+  border: 1px solid rgba(107,76,53,0.28);
+  content: "";
+  inset: 9px;
+  pointer-events: none;
+  position: absolute;
+}
+#sketch-image {
+  height: 100%;
+  max-height: none;
+  max-width: none;
+  object-fit: contain;
+  padding: 4px;
+  width: 100%;
+}
+#sketch-image.charcoal-sketch {
+  filter: grayscale(1) sepia(0.48) contrast(1.18) brightness(0.92);
+}
+.portrait-image-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.sketch-filter-btn,
+.portrait-inspect-btn {
+  box-sizing: border-box;
+  height: 30px;
+  line-height: 22px;
+  margin: 0;
+  padding: 3px 10px;
+}
+.portrait-inspect-btn,
+.portrait-ink-action,
+.portrait-return-btn {
+  background: transparent;
+  border: 1px dashed rgba(107,76,53,0.42);
+  color: #80654b;
+  cursor: pointer;
+  font-family: 'Caveat', cursive;
+  font-size: 17px;
+  padding: 3px 10px;
+}
+.portrait-inspect-btn:hover,
+.portrait-ink-action:hover,
+.portrait-return-btn:hover {
+  color: #5c3a25;
+  background: rgba(107,76,53,0.08);
+}
+.portrait-ink-action {
+  align-self: flex-start;
+  margin-top: 12px;
+}
+.portrait-ink-action.amend-entry {
+  border-color: transparent;
+  font-size: 16px;
+  margin-top: auto;
+  opacity: 0.72;
+}
+.portrait-ink-display {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding: 8px 2px;
+}
+.portrait-ink-title {
+  color: #382416;
+  font-family: 'Caveat', cursive;
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1.15;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+.portrait-ink-memory {
+  color: #493422;
+  font-family: 'Caveat', cursive;
+  font-size: 23px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.portrait-ink-editor {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+.portrait-ink-editor.hidden {
+  display: none;
+}
+.portrait-inspection {
+  align-items: center;
+  background:
+    radial-gradient(ellipse at 18% 12%, rgba(116,72,32,0.2) 0%, rgba(116,72,32,0.07) 16%, transparent 34%),
+    radial-gradient(ellipse at 82% 28%, rgba(255,247,220,0.38) 0%, transparent 26%),
+    radial-gradient(circle at center, #f8efd9 0%, #e5d2ad 72%, #cfb98d 100%);
+  border: 1px solid rgba(107,76,53,0.55);
+  box-shadow: inset 0 0 28px rgba(84,56,28,0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  inset: 18px;
+  justify-content: center;
+  padding: 24px;
+  position: absolute;
+  z-index: 20;
+}
+.portrait-inspection.hidden {
+  display: none;
+}
+.portrait-inspection-title {
+  color: #382416;
+  font-family: 'Caveat', cursive;
+  font-size: 30px;
+  font-weight: 600;
+  text-align: center;
+}
+.portrait-inspection-frame {
+  aspect-ratio: 16 / 9;
+  border: 1px solid rgba(107,76,53,0.42);
+  box-shadow: 0 4px 14px rgba(43,29,18,0.18);
+  flex: 0 1 auto;
+  max-height: calc(100% - 88px);
+  overflow: hidden;
+  padding: 4px;
+  width: 100%;
+}
+.portrait-inspection-frame img {
+  cursor: zoom-out;
+  height: 100%;
+  object-fit: contain;
+  width: 100%;
+}
+.portrait-return-btn {
+  align-self: center;
+  flex: 0 0 auto;
+}
+.sketch-empty { color: #80654b; font-size: 22px; padding: 28px; text-align: center; }
+.sketch-controls {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  flex-shrink: 0;
+}
+.sketch-nav {
+  background: transparent;
+  border: 1px solid rgba(107,76,53,0.48);
+  border-radius: 50%;
+  color: #752222;
+  cursor: pointer;
+  font-family: 'Cinzel', serif;
+  font-size: 16px;
+  height: 28px;
+  line-height: 1;
+  width: 28px;
+}
+.sketch-nav:disabled { cursor: default; opacity: 0.28; }
+.sketch-page { color: #80654b; font-family: 'Cinzel', serif; font-size: 10px; letter-spacing: 1px; }
+.sketch-caption {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid rgba(107,76,53,0.5);
+  color: #2b1d12;
+  font-family: 'Caveat', cursive;
+  font-size: 22px;
+  margin-top: 8px;
+  outline: none;
+  padding: 4px 2px;
+  user-select: text;
+  width: 100%;
+  flex-shrink: 0;
+}
+.sketch-caption::placeholder { color: rgba(43,29,18,0.4); }
+.sketch-memory {
+  border: 1px solid rgba(107,76,53,0.28);
+  min-height: 180px;
+  resize: vertical;
+  white-space: pre-wrap;
+}
