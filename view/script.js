@@ -3,46 +3,12 @@
 //  True two-page book spread architecture (1.6.3)
 // ============================================================
 
-// ── Sample data (replaced by C++ via updateJournalFromSkyrim) ──
+// ── Save data supplied by C++ ──
 let journalData = {
   characterName: 'The last dragonborn',
   date: 'Date unknown',
-  active: [
-    {
-      id: "mg07", tracked: false,
-      title: "The Staff of Magnus",
-      date: "17th of Last Seed, 4E 201",
-      body: "Paratus Decimius confirmed the Staff of Magnus is buried deep within the ruins of Labyrinthian. I need to push past the outer chambers, survive whatever traps the ancient Nords left behind, and retrieve it before Ancano destabilizes the Eye.",
-      objectives: [
-        { text: "Enter the depths of Labyrinthian", done: true },
-        { text: "Defeat the Skeletal Dragon in the chasm", done: true },
-        { text: "Claim the Staff of Magnus from Morokei", done: false }
-      ]
-    },
-    {
-      id: "bounty01", tracked: false,
-      title: "Hunt: The Pale Lady",
-      date: "15th of Last Seed, 4E 201",
-      body: "Locals in Dawnstar spoke of an ancient spirit haunting Frostmere Crypt. No glowing markers—just follow the mountain pass southwest of the city and watch for the cairn stones. Bring silver or enchanted steel.",
-      objectives: [
-        { text: "Locate Frostmere Crypt southwest of Dawnstar", done: false },
-        { text: "Banish the Pale Lady", done: false }
-      ]
-    }
-  ],
-  completed: [
-    {
-      id: "mg06", tracked: false,
-      title: "Revealing the Unseen",
-      date: "16th of Last Seed, 4E 201",
-      body: "Fought through the Falmer infestation in Mzulft and realigned the Oculory lenses. Paratus blamed the College for blocking his projection and is already plotting to report back to the Synod.",
-      objectives: [
-        { text: "Recover the Focusing Crystal", done: true },
-        { text: "Align the Oculory mirrors", done: true },
-        { text: "Report back to Savos Aren", done: true }
-      ]
-    }
-  ]
+  active: [],
+  completed: []
 };
 
 // ── State ──
@@ -55,6 +21,7 @@ let currentSketchSpreadPage = 0;
 let portraitInspectionOpen = false;
 let fieldNotes = [];
 let currentNoteIndex = -1;
+let saveGeneration = 0;
 
 const QUESTS_PER_SPREAD = 16;
 const QUESTS_PER_PAGE   = 8;      // 8 left + 8 right = 16 per spread
@@ -232,11 +199,10 @@ function sortActiveQuests() {
     ((a.order ?? 0) - (b.order ?? 0)));
 }
 
-// Only mentions dates that were actually recorded, so legacy quests never show blanks.
 function formatDateLine(quest) {
   const parts = [];
   if (quest.acceptedDate)  parts.push(`Accepted ${quest.acceptedDate}`);
-  if (quest.completedDate) parts.push(`Completed ${quest.completedDate}`);
+  parts.push(quest.completedDate ? `Completed ${quest.completedDate}` : 'No date recorded');
   return parts.join(' · ');
 }
 
@@ -308,9 +274,9 @@ function openQuestDetail(quest) {
   el.entryDate.innerHTML         = '';
   const detailDates = [];
   if (quest.acceptedDate) detailDates.push(['Accepted', quest.acceptedDate]);
-  if (currentTab === 'completed' && quest.completedDate) detailDates.push(['Completed', quest.completedDate]);
+  if (currentTab === 'completed') detailDates.push(['Completed', quest.completedDate || 'No date recorded']);
   if (detailDates.length === 0 && currentTab !== 'completed') {
-    detailDates.push(['Accepted', quest.date || journalData.date || 'Date unknown']);
+    detailDates.push(['Accepted', 'No date recorded']);
   }
   detailDates.forEach(([label, value]) => {
     const line = document.createElement('span');
@@ -405,7 +371,7 @@ function saveJournalState() {
     };
   });
   if (typeof window.saveJournalUserData !== 'function') return;
-  window.saveJournalUserData(JSON.stringify({ fieldNotes, sketchMetadata }));
+  window.saveJournalUserData(JSON.stringify({ fieldNotes, sketchMetadata, saveGeneration }));
 }
 
 function buildNoteItem(note, index) {
@@ -808,23 +774,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Track/untrack button
   el.trackBtn.addEventListener('click', () => {
-    if (!currentQuest) return;
+    if (!currentQuest || !saveGeneration) return;
     triggerSkyrimSound('focus');
     currentQuest.tracked = !currentQuest.tracked;
     sortActiveQuests();
     renderTrackButton(currentQuest);
     if (typeof window.toggleQuestTracking === 'function') {
-      window.toggleQuestTracking(currentQuest.id);
+      window.toggleQuestTracking(JSON.stringify({ id: currentQuest.id, saveGeneration }));
     }
   });
 
   el.untrackAllBtn.addEventListener('click', () => {
-    if (!journalData.active.some(quest => quest.tracked)) return;
+    if (!saveGeneration || !journalData.active.some(quest => quest.tracked)) return;
     journalData.active.forEach(quest => { quest.tracked = false; });
     sortActiveQuests();
     renderQuestListSpread('active', currentSpreadPage);
     if (typeof window.clearAllQuestTracking === 'function') {
-      window.clearAllQuestTracking();
+      window.clearAllQuestTracking(JSON.stringify({ saveGeneration }));
     }
   });
 
@@ -868,16 +834,11 @@ window.updateJournalFromSkyrim = (incomingJsonData) => {
   try {
     const parsed = typeof incomingJsonData === 'string' ? JSON.parse(incomingJsonData) : incomingJsonData;
 
-    // Preserve local 'tracked' state across data refreshes from C++
-    const prevTracked = new Map();
-    (journalData.active    || []).forEach(q => prevTracked.set(q.id, q.tracked));
-    (journalData.completed || []).forEach(q => prevTracked.set(q.id, q.tracked));
-
     journalData = {
       characterName: parsed.characterName || 'The last dragonborn',
       date:          parsed.date          || 'Date unknown',
-      active:    (Array.isArray(parsed.active)    ? parsed.active    : []).map(q => ({ ...q, tracked: typeof q.tracked === 'boolean' ? q.tracked : Boolean(prevTracked.get(q.id)) })),
-      completed: (Array.isArray(parsed.completed) ? parsed.completed : []).map(q => ({ ...q, tracked: typeof q.tracked === 'boolean' ? q.tracked : Boolean(prevTracked.get(q.id)) }))
+      active:    (Array.isArray(parsed.active)    ? parsed.active    : []).map(q => ({ ...q, tracked: q.tracked === true })),
+      completed: (Array.isArray(parsed.completed) ? parsed.completed : []).map(q => ({ ...q, tracked: q.tracked === true }))
     };
 
     el.characterName.textContent = journalData.characterName;
@@ -905,6 +866,7 @@ window.updateJournalFromSkyrim = (incomingJsonData) => {
 
 window.loadNativeUserData = (data) => {
   const parsed = data || {};
+  saveGeneration = parsed.saveGeneration;
   fieldNotes = Array.isArray(parsed.fieldNotes) ? parsed.fieldNotes.filter(note => typeof note === 'string') : [];
   if (parsed.sketchMetadataExists && parsed.sketchMetadata) {
     nativeSketchMetadata = parsed.sketchMetadata;
@@ -913,6 +875,18 @@ window.loadNativeUserData = (data) => {
   currentNoteIndex = fieldNotes.length > 0 ? Math.min(currentNoteIndex, fieldNotes.length - 1) : -1;
   if (currentTab === 'notes' && currentView === 'notes') renderFieldNotesSpread();
   if (currentTab === 'sketches' && currentView === 'sketches') renderSketchGallery();
+};
+
+window.resetJournalSaveState = () => {
+  saveGeneration = 0;
+  fieldNotes = [];
+  currentNoteIndex = -1;
+  currentQuest = null;
+  currentTab = 'active';
+  currentView = 'list';
+  currentSpreadPage = 0;
+  el.notes.value = '';
+  window.updateJournalFromSkyrim({ active: [], completed: [] });
 };
 
 // C++ screenshot paths for sketches tab
