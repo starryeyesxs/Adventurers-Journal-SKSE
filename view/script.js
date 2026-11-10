@@ -225,6 +225,21 @@ function updateNavButtons() {
 // ══════════════════════════════════════════════════════════════
 //  QUEST LIST SPREAD
 // ══════════════════════════════════════════════════════════════
+// Tracked quests are pinned first; C++ supplies the original order for stable re-sorting.
+function sortActiveQuests() {
+  journalData.active.sort((a, b) =>
+    (Number(Boolean(b.tracked)) - Number(Boolean(a.tracked))) ||
+    ((a.order ?? 0) - (b.order ?? 0)));
+}
+
+// Only mentions dates that were actually recorded, so legacy quests never show blanks.
+function formatDateLine(quest) {
+  const parts = [];
+  if (quest.acceptedDate)  parts.push(`Accepted ${quest.acceptedDate}`);
+  if (quest.completedDate) parts.push(`Completed ${quest.completedDate}`);
+  return parts.join(' · ');
+}
+
 function renderQuestListSpread(category, spreadPage) {
   currentView = 'list';
   currentSpreadPage = spreadPage;
@@ -253,8 +268,19 @@ function renderQuestListSpread(category, spreadPage) {
   const globalOffset = start;
   function buildItem(quest, idx) {
     const li = document.createElement('li');
-    li.className = `quest-item${quest.tracked ? ' tracked' : ''}`;
-    li.innerHTML = `<span>${escapeHtml(quest.title || 'Untitled')}</span><span class="quest-mark">${globalOffset + idx + 1}</span>`;
+    const globalIdx = globalOffset + idx;
+    const classes = ['quest-item'];
+    if (quest.tracked) classes.push('tracked');
+    if (category === 'active') {
+      if (quest.tracked) classes.push('pinned');
+      else if (globalIdx > 0 && quests[globalIdx - 1].tracked && idx % QUESTS_PER_PAGE !== 0) classes.push('pin-divider');
+    }
+    const dateLine = category === 'completed' ? formatDateLine(quest) : '';
+    if (dateLine) classes.push('has-dates');
+    li.className = classes.join(' ');
+    li.innerHTML = `<span class="quest-main"><span class="quest-title">${escapeHtml(quest.title || 'Untitled')}</span>` +
+      (dateLine ? `<span class="quest-dates" title="${escapeHtml(dateLine)}">${escapeHtml(dateLine)}</span>` : '') +
+      `</span><span class="quest-mark">${globalIdx + 1}</span>`;
     li.addEventListener('click', () => {
       triggerSkyrimSound('focus');
       openQuestDetail(quest);
@@ -279,7 +305,23 @@ function openQuestDetail(quest) {
   el.detailEyebrow.textContent   = currentTab === 'completed' ? 'Completed Quest' : 'Active Quest';
   el.entryTitle.textContent      = quest.title || 'Untitled';
   el.objectivesTitle.textContent = 'OBJECTIVES';
-  el.entryDate.textContent       = quest.date  || journalData.date || 'Date unknown';
+  el.entryDate.innerHTML         = '';
+  const detailDates = [];
+  if (quest.acceptedDate) detailDates.push(['Accepted', quest.acceptedDate]);
+  if (currentTab === 'completed' && quest.completedDate) detailDates.push(['Completed', quest.completedDate]);
+  if (detailDates.length === 0 && currentTab !== 'completed') {
+    detailDates.push(['Accepted', quest.date || journalData.date || 'Date unknown']);
+  }
+  detailDates.forEach(([label, value]) => {
+    const line = document.createElement('span');
+    line.className = 'entry-date-line';
+    const labelEl = document.createElement('span');
+    labelEl.className = 'entry-date-label';
+    labelEl.textContent = label;
+    line.append(labelEl, document.createTextNode(` ${value}`));
+    el.entryDate.appendChild(line);
+  });
+  el.entryDate.classList.toggle('hidden', detailDates.length === 0);
   el.entryBody.textContent       = quest.body  || 'No notes written for this entry.';
 
   // Objectives
@@ -350,10 +392,6 @@ function switchTab(tab, btnElement) {
 // ══════════════════════════════════════════════════════════════
 const NOTES_PER_PAGE = 8;
 
-function saveFieldNotes() {
-  localStorage.setItem('skyrim_field_notes_entries', JSON.stringify(fieldNotes));
-}
-
 function saveJournalState() {
   // Merge into the cached native metadata so entries for screenshots not currently
   // listed are kept, and later screenshot reloads re-apply the latest titles.
@@ -422,7 +460,6 @@ function saveCurrentFieldNote() {
     fieldNotes.push(note);
     currentNoteIndex = fieldNotes.length - 1;
   }
-  saveFieldNotes();
   saveJournalState();
   el.notes.blur();
   renderFieldNotesSpread();
@@ -589,18 +626,11 @@ function saveSketchMetadata() {
 //  DOM READY
 // ══════════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
-  // Load saved field notes
-  const savedNotes = localStorage.getItem('skyrim_field_notes_entries');
-  if (savedNotes) {
-    try {
-      const parsed = JSON.parse(savedNotes);
-      fieldNotes = Array.isArray(parsed) ? parsed.filter(n => typeof n === 'string') : [];
-    } catch (e) { console.error('Failed to load field notes:', e); }
-  } else {
-    const legacy = localStorage.getItem('skyrim_field_notes');
-    if (legacy) fieldNotes = [legacy];
-  }
-  currentNoteIndex = fieldNotes.length > 0 ? 0 : -1;
+  // Field notes now live in the SKSE cosave; drop copies left by older versions
+  // so they cannot leak between saves.
+  localStorage.removeItem('skyrim_field_notes_entries');
+  localStorage.removeItem('skyrim_field_notes');
+  currentNoteIndex = -1;
 
   // Field notes keydown — Enter saves, Shift+Enter inserts newline
   el.notes.addEventListener('keydown', (event) => {
@@ -677,7 +707,7 @@ document.addEventListener('DOMContentLoaded', () => {
     el.newNoteBtn.addEventListener('click', () => {
       fieldNotes.push('');
       currentNoteIndex = fieldNotes.length - 1;
-      saveFieldNotes();
+      saveJournalState();
       triggerSkyrimSound('focus');
       openNoteDetail(currentNoteIndex);
     });
@@ -781,6 +811,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!currentQuest) return;
     triggerSkyrimSound('focus');
     currentQuest.tracked = !currentQuest.tracked;
+    sortActiveQuests();
     renderTrackButton(currentQuest);
     if (typeof window.toggleQuestTracking === 'function') {
       window.toggleQuestTracking(currentQuest.id);
@@ -790,6 +821,7 @@ document.addEventListener('DOMContentLoaded', () => {
   el.untrackAllBtn.addEventListener('click', () => {
     if (!journalData.active.some(quest => quest.tracked)) return;
     journalData.active.forEach(quest => { quest.tracked = false; });
+    sortActiveQuests();
     renderQuestListSpread('active', currentSpreadPage);
     if (typeof window.clearAllQuestTracking === 'function') {
       window.clearAllQuestTracking();
@@ -873,25 +905,7 @@ window.updateJournalFromSkyrim = (incomingJsonData) => {
 
 window.loadNativeUserData = (data) => {
   const parsed = data || {};
-  const localNotes = fieldNotes.slice();
-  const localMetadata = {};
-  for (let index = 0; index < localStorage.length; index++) {
-    const key = localStorage.key(index);
-    if (!key || !key.startsWith('skyrim_sketch_caption_')) continue;
-    const id = key.slice('skyrim_sketch_caption_'.length);
-    localMetadata[id] = { caption: localStorage.getItem(key) || '' };
-  }
-
-  if (parsed.fieldNotesExists) {
-    fieldNotes = Array.isArray(parsed.fieldNotes) ? parsed.fieldNotes.filter(note => typeof note === 'string') : [];
-  } else if (localNotes.length || localStorage.getItem('skyrim_field_notes')) {
-    const legacy = localNotes.length ? localNotes :
-      [localStorage.getItem('skyrim_field_notes')].filter(Boolean);
-    fieldNotes = legacy;
-    if (typeof window.saveJournalUserData === 'function') {
-      window.saveJournalUserData(JSON.stringify({ fieldNotes, sketchMetadata: localMetadata }));
-    }
-  }
+  fieldNotes = Array.isArray(parsed.fieldNotes) ? parsed.fieldNotes.filter(note => typeof note === 'string') : [];
   if (parsed.sketchMetadataExists && parsed.sketchMetadata) {
     nativeSketchMetadata = parsed.sketchMetadata;
     sketches.forEach(applySketchMetadata);

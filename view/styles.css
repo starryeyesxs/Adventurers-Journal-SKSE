@@ -290,6 +290,47 @@ html, body {
   border-left: 3px solid #752222;
 }
 .quest-item.tracked .quest-mark::after { content: ' ✦'; color: #752222; font-size: 10px; }
+.quest-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.quest-dates {
+  color: #80654b;
+  font-family: 'Caveat', cursive;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.quest-item.has-dates { padding-top: 4px; padding-bottom: 4px; }
+
+/* Pinned (tracked) quests: faint ink-stained margin, with a quill-line before the rest */
+.quest-item.pinned {
+  background: linear-gradient(to right, rgba(117,34,34,0.10), transparent 70%);
+  border-left: 2px solid rgba(117,34,34,0.5);
+}
+.quest-item.pin-divider { position: relative; }
+.quest-item.pin-divider::before {
+  content: "";
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  top: -3px;
+  height: 1px;
+  background: linear-gradient(to right, transparent, rgba(117,34,34,0.55), transparent);
+  pointer-events: none;
+}
+.entry-date-line { display: block; }
+.entry-date-label {
+  color: #80654b;
+  font-family: 'Cinzel', serif;
+  font-size: 10px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+}
 .quest-mark {
   color: #94785a;
   font-family: 'Caveat', cursive;
