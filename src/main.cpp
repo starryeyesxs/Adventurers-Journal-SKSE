@@ -1,8 +1,11 @@
 #include "PrismaUI_API.h"
+#include "quest_text.h"
 #include <RE/B/BGSRefAlias.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -13,6 +16,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef PlaySound
@@ -37,6 +41,8 @@ namespace
 
     std::mutex screenshotCacheMutex;
     std::unordered_map<std::string, CachedScreenshot> screenshotCache;
+    std::atomic<std::uint64_t> saveGeneration{ 0 };
+    std::atomic<bool> saveReady{ false };
 
     // Vanilla Skyrim sound descriptors — FormIDs verified against Skyrim.esm binary
     constexpr RE::FormID kSoundOpen     = 0x00077C00;  // UIJournalOpen
@@ -147,6 +153,7 @@ namespace
         const auto metadataPath = UserDataDirectory() / "sketch-metadata.json";
         prismaUI->Invoke(journalView, ("window.loadNativeUserData(" + json{
             { "fieldNotes", SnapshotFieldNotes() },
+            { "saveGeneration", saveGeneration.load() },
             { "sketchMetadata", ReadJson(metadataPath, json::object()) },
             { "sketchMetadataExists", fs::exists(metadataPath) }
         }.dump(-1, ' ', false, json::error_handler_t::replace) + ")").c_str());
@@ -395,67 +402,49 @@ namespace
 
     std::string ResolveQuestText(RE::TESQuest* quest, std::string_view text)
     {
-        std::string resolved;
-        resolved.reserve(text.size());
-
-        const auto equalsIgnoreCase = [](std::string_view left, std::string_view right) {
-            if (left.size() != right.size()) {
-                return false;
-            }
-            for (std::size_t index = 0; index < left.size(); ++index) {
-                if (std::tolower(static_cast<unsigned char>(left[index])) !=
-                    std::tolower(static_cast<unsigned char>(right[index]))) {
-                    return false;
+        return quest_text::Resolve(text, [quest](std::string_view type, std::string_view name)
+            -> std::optional<std::string> {
+            if (quest_text::EqualIgnoreCase(type, "Global")) {
+                std::string editorID(name);
+                // Some translations corrupt the J in MGRJ1 or terminate the tag early.
+                if (quest_text::EqualIgnoreCase(std::string_view(editorID).substr(0, 5), "MGR)1")) {
+                    editorID.replace(3, 1, "J");
+                } else if (quest_text::EqualIgnoreCase(editorID, "MGR1Test")) {
+                    editorID = "MGRJ1Test";
                 }
-            }
-            return true;
-        };
-
-        std::size_t cursor = 0;
-        while (cursor < text.size()) {
-            const auto tokenStart = text.find('<', cursor);
-            if (tokenStart == std::string_view::npos) {
-                resolved.append(text.substr(cursor));
-                break;
-            }
-
-            resolved.append(text.substr(cursor, tokenStart - cursor));
-            const auto tokenEnd = text.find('>', tokenStart + 1);
-            if (tokenEnd == std::string_view::npos) {
-                resolved.append(text.substr(tokenStart));
-                break;
-            }
-
-            const auto token = text.substr(tokenStart + 1, tokenEnd - tokenStart - 1);
-            const auto separator = token.find('=');
-            const auto tokenType = separator == std::string_view::npos
-                                       ? token
-                                       : token.substr(0, separator);
-            if (!equalsIgnoreCase(tokenType, "Alias") &&
-                !equalsIgnoreCase(tokenType, "Alias.CurrentName")) {
-                resolved.append(text.substr(tokenStart, tokenEnd - tokenStart + 1));
-                cursor = tokenEnd + 1;
-                continue;
-            }
-
-            const auto aliasName = separator == std::string_view::npos
-                                       ? std::string_view{}
-                                       : token.substr(separator + 1);
-            std::string replacement;
-            bool aliasFound = false;
-            bool referenceFound = false;
-            if (quest) {
+                auto* global = RE::TESForm::LookupByEditorID<RE::TESGlobal>(editorID);
+                if (!global) {
+                    if (const auto data = RE::TESDataHandler::GetSingleton()) {
+                        for (auto* candidate : data->GetFormArray<RE::TESGlobal>()) {
+                            if (candidate && candidate->GetFormEditorID() &&
+                                quest_text::EqualIgnoreCase(candidate->GetFormEditorID(), editorID)) {
+                                global = candidate;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (global && std::isfinite(global->value)) {
+                    return std::format("{:g}", global->value);
+                }
+                const auto questID = quest ? quest->GetFormEditorID() : nullptr;
+                if (questID && (quest_text::EqualIgnoreCase(questID, "MGRAppJzargo01") ||
+                                quest_text::EqualIgnoreCase(questID, "MGRitual01")) &&
+                    (quest_text::EqualIgnoreCase(editorID, "MGR1") ||
+                     quest_text::EqualIgnoreCase(editorID, "MGRJ1"))) {
+                    return "3";
+                }
+            } else if (quest && (quest_text::EqualIgnoreCase(type, "Alias") ||
+                                 quest_text::EqualIgnoreCase(type, "Alias.CurrentName"))) {
                 for (const auto alias : quest->aliases) {
                     if (!alias || !alias->aliasName.c_str() ||
-                        !equalsIgnoreCase(alias->aliasName.c_str(), aliasName)) {
+                        !quest_text::EqualIgnoreCase(alias->aliasName.c_str(), name)) {
                         continue;
                     }
 
-                    aliasFound = true;
                     RE::TESObjectREFR* reference = nullptr;
                     const auto refIt = quest->refAliasMap.find(alias->aliasID);
                     if (refIt != quest->refAliasMap.end() && refIt->second) {
-                        referenceFound = true;
                         const auto resolvedReference = refIt->second.get();
                         reference = resolvedReference.get();
                     }
@@ -463,37 +452,23 @@ namespace
                     if (!reference) {
                         const auto refAlias = dynamic_cast<RE::BGSRefAlias*>(alias);
                         reference = refAlias ? refAlias->GetReference() : nullptr;
-                        referenceFound = reference != nullptr;
                     }
 
                     if (reference) {
-                        if (const auto name = reference->GetName(); name && *name != '\0') {
-                            replacement = name;
+                        if (const auto displayName = reference->GetName(); displayName && *displayName != '\0') {
+                            return std::string(displayName);
                         } else if (const auto form = reference->GetObjectReference();
                                    form && form->GetName() && *form->GetName() != '\0') {
-                            replacement = form->GetName();
+                            return std::string(form->GetName());
                         }
                     }
                     break;
                 }
             }
-
-            if (replacement.empty()) {
-                resolved.append(text.substr(tokenStart, tokenEnd - tokenStart + 1));
-                const auto questName = quest && quest->GetFullName() ? quest->GetFullName() : "<unnamed>";
-                logger::warn(
-                    "Quest text replacement unresolved: quest='{}', alias='{}', reason={}",
-                    questName,
-                    aliasName,
-                    !quest ? "quest unavailable" : !aliasFound ? "alias not found" :
-                    !referenceFound ? "alias unfilled" : "reference has no display name");
-            } else {
-                resolved += replacement;
-            }
-            cursor = tokenEnd + 1;
-        }
-
-        return resolved;
+            logger::warn("Quest text replacement unresolved: quest='{}', type='{}', name='{}'",
+                quest && quest->GetFullName() ? quest->GetFullName() : "<unnamed>", type, name);
+            return std::nullopt;
+        });
     }
 
     const char* QuestName(const RE::TESQuest* quest)
@@ -545,14 +520,19 @@ namespace
     {
         bool hasAccepted = false;
         bool hasCompleted = false;
+        bool hasTracked = false;
+        bool tracked = false;
         float acceptedDays = 0.0f;
         float completedDays = 0.0f;
+        std::uint64_t completionOrder = 0;
         std::string acceptedDate;
         std::string completedDate;
     };
 
     std::mutex questTimesMutex;
     std::unordered_map<RE::FormID, QuestTimes> questTimes;
+    std::unordered_set<RE::FormID> observedActiveQuests;
+    std::uint64_t nextCompletionOrder = 0;
 
     constexpr std::uint32_t MakeTag(char a, char b, char c, char d)
     {
@@ -564,7 +544,7 @@ namespace
 
     constexpr std::uint32_t kSerializationUID = MakeTag('A', 'J', 'N', 'L');
     constexpr std::uint32_t kQuestTimesRecord = MakeTag('Q', 'T', 'M', 'S');
-    constexpr std::uint32_t kQuestTimesVersion = 1;
+    constexpr std::uint32_t kQuestTimesVersion = 2;
     constexpr std::uint32_t kMaxStampLength = 256;
 
     bool GetNowStamp(float& days, std::string& date)
@@ -727,26 +707,40 @@ namespace
 
     // Stamps first-seen (accepted) and completion times. `visible` skips the journal-visibility
     // check when the caller has already performed it.
-    bool ReconcileQuestTimes(RE::TESQuest* quest, RE::PlayerCharacter* player, bool visible = false)
+    bool ReconcileQuestTimes(RE::TESQuest* quest, RE::PlayerCharacter* player, bool visible = false,
+                             bool completionEvent = false)
     {
-        if (!quest) {
+        if (!quest || !saveReady.load()) {
             return false;
         }
 
+        const auto generation = saveGeneration.load();
         const auto formID = quest->GetFormID();
         const bool completed = quest->IsCompleted();
 
         if (completed) {
+            if (!completionEvent) {
+                return false;
+            }
             // Completed with no record: a legacy quest, deliberately left unstamped.
             std::scoped_lock lock(questTimesMutex);
             const auto it = questTimes.find(formID);
-            if (it == questTimes.end() || it->second.hasCompleted) {
+            if (it == questTimes.end() || !it->second.hasAccepted || it->second.hasCompleted ||
+                !observedActiveQuests.contains(formID)) {
                 return false;
             }
         }
 
         if (!visible && !ShouldShowQuest(quest, player)) {
             return false;
+        }
+
+        if (!completed) {
+            std::scoped_lock lock(questTimesMutex);
+            if (!saveReady.load() || generation != saveGeneration.load()) {
+                return false;
+            }
+            observedActiveQuests.insert(formID);
         }
 
         float days = 0.0f;
@@ -756,23 +750,28 @@ namespace
         }
 
         std::scoped_lock lock(questTimesMutex);
+        if (!saveReady.load() || generation != saveGeneration.load()) {
+            return false;
+        }
         auto it = questTimes.find(formID);
         if (completed) {
-            if (it == questTimes.end() || it->second.hasCompleted) {
+            if (it == questTimes.end() || !it->second.hasAccepted || it->second.hasCompleted ||
+                !observedActiveQuests.contains(formID)) {
                 return false;
             }
+            observedActiveQuests.erase(formID);
             it->second.hasCompleted = true;
             it->second.completedDays = days;
             it->second.completedDate = std::move(date);
+            it->second.completionOrder = ++nextCompletionOrder;
             return true;
         }
 
-        if (it == questTimes.end()) {
-            QuestTimes times;
+        if (it == questTimes.end() || !it->second.hasAccepted) {
+            auto& times = questTimes[formID];
             times.hasAccepted = true;
             times.acceptedDays = days;
             times.acceptedDate = std::move(date);
-            questTimes.emplace(formID, std::move(times));
             return true;
         }
 
@@ -781,6 +780,9 @@ namespace
             it->second.hasCompleted = false;
             it->second.completedDate.clear();
             it->second.completedDays = 0.0f;
+            it->second.completionOrder = 0;
+            it->second.acceptedDays = days;
+            it->second.acceptedDate = std::move(date);
             return true;
         }
         return false;
@@ -788,6 +790,9 @@ namespace
 
     void ReconcileAllQuestTimes()
     {
+        if (!saveReady.load()) {
+            return;
+        }
         const auto player = RE::PlayerCharacter::GetSingleton();
         const auto dataHandler = RE::TESDataHandler::GetSingleton();
         if (!player || !dataHandler) {
@@ -809,13 +814,11 @@ namespace
     constexpr std::uint32_t kMaxNoteLength = 1 << 16;
     constexpr std::uint32_t kMaxNoteCount = 1024;
 
-    void WriteString(SKSE::SerializationInterface* intfc, const std::string& value, std::uint32_t maxLength)
+    bool WriteString(SKSE::SerializationInterface* intfc, const std::string& value, std::uint32_t maxLength)
     {
         const auto length = static_cast<std::uint32_t>(std::min<std::size_t>(value.size(), maxLength));
-        intfc->WriteRecordData(length);
-        if (length > 0) {
-            intfc->WriteRecordData(value.data(), length);
-        }
+        return intfc->WriteRecordData(length) &&
+               (length == 0 || intfc->WriteRecordData(value.data(), length));
     }
 
     bool ReadString(SKSE::SerializationInterface* intfc, std::string& value, std::uint32_t maxLength)
@@ -836,27 +839,58 @@ namespace
 
     void SaveCosave(SKSE::SerializationInterface* intfc)
     {
+        const auto generation = saveGeneration.load();
+        if (!saveReady.load()) {
+            logger::error("AdventurersJournal: refusing to save quest metadata during a load");
+            return;
+        }
         std::scoped_lock lock(questTimesMutex);
+        if (!saveReady.load() || generation != saveGeneration.load()) {
+            logger::error("AdventurersJournal: save transition interrupted quest metadata snapshot");
+            return;
+        }
+
+        if (const auto data = RE::TESDataHandler::GetSingleton()) {
+            for (auto* quest : data->GetFormArray<RE::TESQuest>()) {
+                if (quest && quest->IsRunning() && !quest->IsCompleted()) {
+                    auto& times = questTimes[quest->GetFormID()];
+                    times.hasTracked = true;
+                    times.tracked = quest->IsActive();
+                }
+            }
+        } else {
+            logger::error("AdventurersJournal: cannot snapshot tracked quests without the data handler");
+        }
 
         if (intfc->OpenRecord(kQuestTimesRecord, kQuestTimesVersion)) {
-            intfc->WriteRecordData(static_cast<std::uint32_t>(questTimes.size()));
+            bool success = intfc->WriteRecordData(static_cast<std::uint32_t>(questTimes.size()));
             for (const auto& [formID, times] : questTimes) {
                 const std::uint32_t id = formID;
-                const std::uint8_t flags = (times.hasAccepted ? 1 : 0) | (times.hasCompleted ? 2 : 0);
-                intfc->WriteRecordData(id);
-                intfc->WriteRecordData(flags);
-                intfc->WriteRecordData(times.acceptedDays);
-                intfc->WriteRecordData(times.completedDays);
-                WriteString(intfc, times.acceptedDate, kMaxStampLength);
-                WriteString(intfc, times.completedDate, kMaxStampLength);
+                const std::uint8_t flags = (times.hasAccepted ? 1 : 0) | (times.hasCompleted ? 2 : 0) |
+                                           (times.hasTracked ? 4 : 0) | (times.tracked ? 8 : 0);
+                success = success && intfc->WriteRecordData(id) && intfc->WriteRecordData(flags) &&
+                          intfc->WriteRecordData(times.acceptedDays) && intfc->WriteRecordData(times.completedDays) &&
+                          WriteString(intfc, times.acceptedDate, kMaxStampLength) &&
+                          WriteString(intfc, times.completedDate, kMaxStampLength) &&
+                          intfc->WriteRecordData(times.completionOrder);
             }
+            if (!success) {
+                logger::error("AdventurersJournal: failed to write quest-times record");
+            }
+        } else {
+            logger::error("AdventurersJournal: failed to open quest-times record");
         }
 
         if (intfc->OpenRecord(kFieldNotesRecord, kFieldNotesVersion)) {
-            intfc->WriteRecordData(static_cast<std::uint32_t>(fieldNotes.size()));
+            bool success = intfc->WriteRecordData(static_cast<std::uint32_t>(fieldNotes.size()));
             for (const auto& note : fieldNotes) {
-                WriteString(intfc, note, kMaxNoteLength);
+                success = success && WriteString(intfc, note, kMaxNoteLength);
             }
+            if (!success) {
+                logger::error("AdventurersJournal: failed to write field-notes record");
+            }
+        } else {
+            logger::error("AdventurersJournal: failed to open field-notes record");
         }
     }
 
@@ -864,14 +898,16 @@ namespace
     {
         std::unordered_map<RE::FormID, QuestTimes> loadedTimes;
         std::vector<std::string> loadedNotes;
+        std::uint64_t loadedCompletionOrder = 0;
 
         std::uint32_t type = 0;
         std::uint32_t version = 0;
         std::uint32_t length = 0;
         while (intfc->GetNextRecordInfo(type, version, length)) {
             std::uint32_t count = 0;
-            if (type == kQuestTimesRecord && version == kQuestTimesVersion) {
-                if (intfc->ReadRecordData(count) != sizeof(count)) {
+            if (type == kQuestTimesRecord && (version == 1 || version == kQuestTimesVersion)) {
+                if (intfc->ReadRecordData(count) != sizeof(count) || count > length / 17) {
+                    logger::warn("AdventurersJournal: invalid quest-times record count");
                     continue;
                 }
                 for (std::uint32_t i = 0; i < count; ++i) {
@@ -883,20 +919,27 @@ namespace
                         intfc->ReadRecordData(times.acceptedDays) != sizeof(float) ||
                         intfc->ReadRecordData(times.completedDays) != sizeof(float) ||
                         !ReadString(intfc, times.acceptedDate, kMaxStampLength) ||
-                        !ReadString(intfc, times.completedDate, kMaxStampLength)) {
+                        !ReadString(intfc, times.completedDate, kMaxStampLength) ||
+                        (version >= 2 && intfc->ReadRecordData(times.completionOrder) != sizeof(times.completionOrder))) {
                         logger::warn("AdventurersJournal: truncated quest-times record");
                         break;
                     }
                     times.hasAccepted = (flags & 1) != 0;
                     times.hasCompleted = (flags & 2) != 0;
+                    times.hasTracked = (flags & 4) != 0;
+                    times.tracked = (flags & 8) != 0;
 
                     RE::FormID newID = 0;
                     if (intfc->ResolveFormID(oldID, newID)) {
+                        loadedCompletionOrder = (std::max)(loadedCompletionOrder, times.completionOrder);
                         loadedTimes[newID] = std::move(times);
+                    } else {
+                        logger::warn("AdventurersJournal: cannot resolve saved quest FormID 0x{:08X}", oldID);
                     }
                 }
             } else if (type == kFieldNotesRecord && version == kFieldNotesVersion) {
                 if (intfc->ReadRecordData(count) != sizeof(count) || count > kMaxNoteCount) {
+                    logger::warn("AdventurersJournal: invalid field-notes record count");
                     continue;
                 }
                 for (std::uint32_t i = 0; i < count; ++i) {
@@ -907,23 +950,60 @@ namespace
                     }
                     loadedNotes.push_back(std::move(note));
                 }
+            } else if (type == kQuestTimesRecord || type == kFieldNotesRecord) {
+                logger::warn("AdventurersJournal: unsupported cosave record version {} for type 0x{:08X}",
+                    version, type);
             }
         }
 
         std::scoped_lock lock(questTimesMutex);
         questTimes = std::move(loadedTimes);
         fieldNotes = std::move(loadedNotes);
+        nextCompletionOrder = loadedCompletionOrder;
+    }
+
+    void ClearSaveState()
+    {
+        std::scoped_lock lock(questTimesMutex);
+        questTimes.clear();
+        observedActiveQuests.clear();
+        fieldNotes.clear();
+        nextCompletionOrder = 0;
     }
 
     void RevertCosave(SKSE::SerializationInterface*)
     {
+        ClearSaveState();
+    }
+
+    void RestoreQuestTracking()
+    {
+        const auto data = RE::TESDataHandler::GetSingleton();
+        if (!data) {
+            logger::error("AdventurersJournal: cannot restore tracked quests without the data handler");
+            return;
+        }
         std::scoped_lock lock(questTimesMutex);
-        questTimes.clear();
-        fieldNotes.clear();
+        for (auto* quest : data->GetFormArray<RE::TESQuest>()) {
+            if (!quest || !quest->IsRunning() || quest->IsCompleted()) {
+                continue;
+            }
+            const auto it = questTimes.find(quest->GetFormID());
+            if (it != questTimes.end() && it->second.hasTracked && quest->IsActive() != it->second.tracked) {
+                quest->data.flags.set(it->second.tracked, RE::QuestFlag::kActive);
+                quest->AddChange(RE::TESQuest::ChangeFlags::kQuestFlags);
+            }
+        }
+        if (const auto player = RE::PlayerCharacter::GetSingleton()) {
+            player->GetPlayerFlags().forceQuestTargetRepath = true;
+        }
     }
 
     std::string BuildJournalJson()
     {
+        if (!saveReady.load()) {
+            return "{\"active\":[],\"completed\":[]}";
+        }
         const auto player = RE::PlayerCharacter::GetSingleton();
         const auto dataHandler = RE::TESDataHandler::GetSingleton();
         if (!player || !dataHandler) {
@@ -970,8 +1050,8 @@ namespace
             return quest->IsActive();
         });
 
-        // Newest completion first; quests without a completion stamp fall back to their
-        // accepted time, and fully legacy quests keep their existing order at the bottom.
+        // Recorded completion sequence takes precedence over older version-1 records.
+        // Unsequenced quests fall back to their saved dates, then their live order.
         std::unordered_map<RE::FormID, std::optional<QuestTimes>> completedTimes;
         for (const auto quest : completedQuests) {
             completedTimes[quest->GetFormID()] = GetQuestTimes(quest->GetFormID());
@@ -989,7 +1069,14 @@ namespace
             }
             return std::nullopt;
         };
-        std::stable_sort(completedQuests.begin(), completedQuests.end(), [&sortKey](RE::TESQuest* a, RE::TESQuest* b) {
+        std::stable_sort(completedQuests.begin(), completedQuests.end(), [&sortKey, &completedTimes](RE::TESQuest* a, RE::TESQuest* b) {
+            const auto& timesA = completedTimes[a->GetFormID()];
+            const auto& timesB = completedTimes[b->GetFormID()];
+            const auto orderA = timesA && timesA->hasCompleted ? timesA->completionOrder : 0;
+            const auto orderB = timesB && timesB->hasCompleted ? timesB->completionOrder : 0;
+            if (orderA != orderB) {
+                return orderA > orderB;
+            }
             const auto keyA = sortKey(a);
             const auto keyB = sortKey(b);
             if (keyA.has_value() != keyB.has_value()) {
@@ -1038,7 +1125,11 @@ namespace
                     }
                 }
                 std::scoped_lock lock(questTimesMutex);
-                fieldNotes = std::move(notes);
+                if (saveReady.load() && data.value("saveGeneration", std::uint64_t{ 0 }) == saveGeneration.load()) {
+                    fieldNotes = std::move(notes);
+                } else {
+                    logger::warn("AdventurersJournal: ignored field notes from an inactive save");
+                }
             }
             if (data.contains("sketchMetadata")) {
                 AtomicWriteJson(UserDataDirectory() / "sketch-metadata.json", data.at("sketchMetadata"));
@@ -1048,54 +1139,104 @@ namespace
         }
     }
 
-    // Toggle the kActive tracking flag on the quest identified by its hex FormID string.
-    // The HUD compass is updated automatically when kActive changes.
-    void ToggleQuestTracking(const char* formIDHex)
+    std::optional<json> ReadTrackingRequest(const char* payload)
     {
-        if (!formIDHex || *formIDHex == '\0') {
+        if (!payload) {
+            logger::warn("AdventurersJournal: missing quest tracking request");
+            return std::nullopt;
+        }
+        try {
+            auto request = json::parse(payload);
+            if (!request.is_object() || !request.contains("saveGeneration") ||
+                !request.at("saveGeneration").is_number_unsigned()) {
+                logger::warn("AdventurersJournal: invalid quest tracking request");
+                return std::nullopt;
+            }
+            return request;
+        } catch (const json::exception& error) {
+            logger::warn("AdventurersJournal: invalid quest tracking request: {}", error.what());
+            return std::nullopt;
+        }
+    }
+
+    void ToggleQuestTracking(const char* payload)
+    {
+        const auto request = ReadTrackingRequest(payload);
+        if (!request || !request->contains("id") || !request->at("id").is_string()) {
+            if (request) {
+                logger::warn("AdventurersJournal: missing quest FormID in tracking request");
+            }
+            return;
+        }
+        const auto formIDHex = request->at("id").get<std::string>();
+        const auto generation = request->at("saveGeneration").get<std::uint64_t>();
+        if (!saveReady.load() || generation != saveGeneration.load()) {
+            logger::warn("AdventurersJournal: ignored quest tracking request from an inactive save");
+            return;
+        }
+        if (formIDHex.size() != 8 || !std::all_of(formIDHex.begin(), formIDHex.end(), [](unsigned char ch) {
+                return std::isxdigit(ch) != 0;
+            })) {
+            logger::warn("AdventurersJournal: invalid quest FormID in tracking request");
             return;
         }
         const auto taskInterface = SKSE::GetTaskInterface();
         if (!taskInterface) {
+            logger::warn("ToggleQuestTracking: task interface unavailable");
             return;
         }
-        // Parse hex FormID from JS (e.g. "0003CABB")
-        const RE::FormID formID = static_cast<RE::FormID>(std::strtoul(formIDHex, nullptr, 16));
+        const RE::FormID formID = static_cast<RE::FormID>(std::strtoul(formIDHex.c_str(), nullptr, 16));
         if (formID == 0) {
+            logger::warn("ToggleQuestTracking: invalid zero quest FormID");
             return;
         }
-        taskInterface->AddTask([formID] {
-            const auto dataHandler = RE::TESDataHandler::GetSingleton();
-            auto* quest = dataHandler ? dataHandler->LookupForm<RE::TESQuest>(formID, "Skyrim.esm") : nullptr;
-            // Also search all loaded mods if not in Skyrim.esm
-            if (!quest) {
-                quest = RE::TESForm::LookupByID<RE::TESQuest>(formID);
+        taskInterface->AddTask([formID, generation] {
+            if (!saveReady.load() || generation != saveGeneration.load()) {
+                return;
             }
-            if (!quest) {
+            auto* quest = RE::TESForm::LookupByID<RE::TESQuest>(formID);
+            if (!quest || !quest->IsRunning() || quest->IsCompleted()) {
                 logger::warn("ToggleQuestTracking: quest 0x{:08X} not found", formID);
                 return;
             }
             const bool nowActive = !quest->IsActive();
             quest->data.flags.set(nowActive, RE::QuestFlag::kActive);
+            quest->AddChange(RE::TESQuest::ChangeFlags::kQuestFlags);
+            if (const auto player = RE::PlayerCharacter::GetSingleton()) {
+                player->GetPlayerFlags().forceQuestTargetRepath = true;
+            }
             logger::info("ToggleQuestTracking: quest '{}' 0x{:08X} tracked={}", quest->GetFullName(), formID, nowActive);
             SendJournalData();
         });
     }
 
-    void ClearAllQuestTracking()
+    void ClearAllQuestTracking(const char* payload)
     {
+        const auto request = ReadTrackingRequest(payload);
+        if (!request) {
+            return;
+        }
+        const auto generation = request->at("saveGeneration").get<std::uint64_t>();
+        if (!saveReady.load() || generation != saveGeneration.load()) {
+            logger::warn("AdventurersJournal: ignored untrack request from an inactive save");
+            return;
+        }
         const auto taskInterface = SKSE::GetTaskInterface();
         if (!taskInterface) {
             logger::warn("ClearAllQuestTracking: task interface unavailable");
             return;
         }
 
-        taskInterface->AddTask([] {
+        taskInterface->AddTask([generation] {
+            if (!saveReady.load() || generation != saveGeneration.load()) {
+                return;
+            }
             const auto dataHandler = RE::TESDataHandler::GetSingleton();
             if (dataHandler) {
                 for (auto* quest : dataHandler->GetFormArray<RE::TESQuest>()) {
                     if (quest && quest->IsActive()) {
                         quest->data.flags.set(false, RE::QuestFlag::kActive);
+                        quest->AddChange(RE::TESQuest::ChangeFlags::kQuestFlags);
                     }
                 }
             }
@@ -1212,13 +1353,20 @@ namespace
     // Deferred one frame so objectives and the completed flag have settled before stamping.
     void ReconcileQuestLater(RE::FormID formID)
     {
+        if (!saveReady.load()) {
+            return;
+        }
         const auto taskInterface = SKSE::GetTaskInterface();
         if (!taskInterface) {
             return;
         }
-        taskInterface->AddTask([formID] {
+        const auto generation = saveGeneration.load();
+        taskInterface->AddTask([formID, generation] {
+            if (!saveReady.load() || generation != saveGeneration.load()) {
+                return;
+            }
             if (const auto quest = RE::TESForm::LookupByID<RE::TESQuest>(formID)) {
-                ReconcileQuestTimes(quest, RE::PlayerCharacter::GetSingleton());
+                ReconcileQuestTimes(quest, RE::PlayerCharacter::GetSingleton(), false, true);
             }
             if (journalOpen) {
                 SendJournalData();
@@ -1262,15 +1410,47 @@ namespace
 
 static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
 {
-    if (message && (message->type == SKSE::MessagingInterface::kPostLoadGame ||
-                    message->type == SKSE::MessagingInterface::kNewGame)) {
-        if (const auto taskInterface = SKSE::GetTaskInterface()) {
-            taskInterface->AddTask([] { ReconcileAllQuestTimes(); });
-        }
+    if (!message) {
         return;
     }
 
-    if (!message || message->type != SKSE::MessagingInterface::kDataLoaded) {
+    if (message->type == SKSE::MessagingInterface::kPreLoadGame ||
+        message->type == SKSE::MessagingInterface::kNewGame) {
+        saveReady.store(false);
+        ++saveGeneration;
+        ClearSaveState();
+        if (journalViewReady && prismaUI && prismaUI->IsValid(journalView)) {
+            CloseJournal();
+            prismaUI->Invoke(journalView, "window.resetJournalSaveState()");
+        }
+        if (message->type == SKSE::MessagingInterface::kPreLoadGame) {
+            return;
+        }
+        saveReady.store(true);
+    } else if (message->type == SKSE::MessagingInterface::kPostLoadGame) {
+        // SKSE passes the boolean result as the pointer value, not a bool pointer.
+        if (!message->data) {
+            ClearSaveState();
+            logger::warn("AdventurersJournal: save load failed; quest state remains unavailable");
+            return;
+        }
+        saveReady.store(true);
+        RestoreQuestTracking();
+    } else if (message->type != SKSE::MessagingInterface::kDataLoaded) {
+        return;
+    }
+
+    if (message->type != SKSE::MessagingInterface::kDataLoaded) {
+        if (const auto taskInterface = SKSE::GetTaskInterface()) {
+            const auto generation = saveGeneration.load();
+            taskInterface->AddTask([generation] {
+                if (saveReady.load() && generation == saveGeneration.load()) {
+                    ReconcileAllQuestTimes();
+                }
+            });
+        } else {
+            logger::warn("AdventurersJournal: cannot reconcile quest timestamps; task interface unavailable");
+        }
         return;
     }
 
@@ -1300,11 +1480,11 @@ static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
         isTyping = journalOpen && state && (std::strcmp(state, "true") == 0 || std::strcmp(state, "1") == 0);
         SetTextInputActive(isTyping);
     });
-    prismaUI->RegisterJSListener(journalView, "toggleQuestTracking", [](const char* formIDHex) {
-        ToggleQuestTracking(formIDHex);
+    prismaUI->RegisterJSListener(journalView, "toggleQuestTracking", [](const char* payload) {
+        ToggleQuestTracking(payload);
     });
-    prismaUI->RegisterJSListener(journalView, "clearAllQuestTracking", [](const char*) {
-        ClearAllQuestTracking();
+    prismaUI->RegisterJSListener(journalView, "clearAllQuestTracking", [](const char* payload) {
+        ClearAllQuestTracking(payload);
     });
     prismaUI->RegisterJSListener(journalView, "requestJournalUserData", [](const char*) {
         SendJournalUserData();
@@ -1348,8 +1528,12 @@ extern "C" DLLEXPORT bool SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
         serialization->SetLoadCallback(LoadCosave);
         serialization->SetRevertCallback(RevertCosave);
     } else {
-        logger::critical("Serialization interface unavailable; quest dates will not persist.");
+        logger::critical("Serialization interface unavailable; refusing to load without per-save quest state.");
+        return false;
     }
-    messaging->RegisterListener("SKSE", SKSEMessageHandler);
+    if (!messaging->RegisterListener("SKSE", SKSEMessageHandler)) {
+        logger::critical("Failed to register SKSE message listener.");
+        return false;
+    }
     return true;
 }
