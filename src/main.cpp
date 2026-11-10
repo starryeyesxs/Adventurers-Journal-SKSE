@@ -1,5 +1,7 @@
 #include "PrismaUI_API.h"
 #include <RE/B/BGSRefAlias.h>
+#include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -9,7 +11,9 @@
 #include <iterator>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <unordered_map>
+#include <vector>
 
 #ifdef PlaySound
 #	undef PlaySound
@@ -132,23 +136,20 @@ namespace
         }
     }
 
+    json SnapshotFieldNotes();
+
     void SendJournalUserData()
     {
         if (!journalViewReady || !prismaUI || !prismaUI->IsValid(journalView)) {
             return;
         }
 
-        const auto userData = UserDataDirectory();
-        const bool notesExist = fs::exists(userData / "field-notes.json");
-        const bool metadataExist = fs::exists(userData / "sketch-metadata.json");
-        const auto notes = ReadJson(userData / "field-notes.json", json::array());
-        const auto metadata = ReadJson(userData / "sketch-metadata.json", json::object());
+        const auto metadataPath = UserDataDirectory() / "sketch-metadata.json";
         prismaUI->Invoke(journalView, ("window.loadNativeUserData(" + json{
-            { "fieldNotes", notes },
-            { "sketchMetadata", metadata },
-            { "fieldNotesExists", notesExist },
-            { "sketchMetadataExists", metadataExist }
-        }.dump() + ")").c_str());
+            { "fieldNotes", SnapshotFieldNotes() },
+            { "sketchMetadata", ReadJson(metadataPath, json::object()) },
+            { "sketchMetadataExists", fs::exists(metadataPath) }
+        }.dump(-1, ' ', false, json::error_handler_t::replace) + ")").c_str());
     }
 
     void SendJournalScreenshots()
@@ -250,10 +251,87 @@ namespace
         });
     }
 
-    bool IsJournalBlocked()
+    bool CanOpenJournal()
     {
         const auto ui = RE::UI::GetSingleton();
-        return ui && (ui->IsMenuOpen("Main Menu") || ui->IsMenuOpen("Loading Menu"));
+        const auto controlMap = RE::ControlMap::GetSingleton();
+        if (!ui || !controlMap || ui->GameIsPaused()) {
+            return false;
+        }
+
+        static constexpr std::array blockingMenus{
+            "Main Menu"sv,
+            "Loading Menu"sv,
+            "Journal Menu"sv,
+            "InventoryMenu"sv,
+            "MagicMenu"sv,
+            "MapMenu"sv,
+            "TweenMenu"sv,
+            "Dialogue Menu"sv,
+            "ContainerMenu"sv,
+            "Crafting Menu"sv,
+            "Lockpicking Menu"sv,
+            "Console"sv,
+            "MessageBoxMenu"sv
+        };
+        for (const auto menuName : blockingMenus) {
+            if (ui->IsMenuOpen(menuName)) {
+                return false;
+            }
+        }
+
+        const auto& runtimeData = controlMap->GetRuntimeData();
+        const auto& contexts = runtimeData.contextPriorityStack;
+        return runtimeData.textEntryCount == 0 &&
+               !contexts.empty() &&
+               contexts.front() == RE::ControlMap::InputContextID::kGameplay;
+    }
+
+    bool IsControlMapTextInputActive()
+    {
+        const auto controlMap = RE::ControlMap::GetSingleton();
+        return controlMap && controlMap->GetRuntimeData().textEntryCount > 0;
+    }
+
+    // Only touched on the game thread (via SKSE task queue) so the ControlMap
+    // text-entry counter is incremented/decremented exactly once per transition.
+    bool textInputHeld = false;
+
+    void SetTextInputActive(bool active)
+    {
+        SKSE::GetTaskInterface()->AddTask([active]() {
+            if (textInputHeld == active) {
+                return;
+            }
+            if (const auto controlMap = RE::ControlMap::GetSingleton()) {
+                controlMap->AllowTextInput(active);
+                textInputHeld = active;
+            }
+        });
+    }
+
+    // Drops keyboard events from the list so other sinks (and their hotkeys) never see them.
+    void StripKeyboardEvents(RE::InputEvent** head)
+    {
+        RE::InputEvent* first = nullptr;
+        RE::InputEvent* last = nullptr;
+        for (auto event = *head; event;) {
+            const auto next = event->next;
+            const auto isKeyboard = event->GetDevice() == RE::INPUT_DEVICE::kKeyboard;
+            if (!isKeyboard) {
+                if (last) {
+                    last->next = event;
+                } else {
+                    first = event;
+                }
+                last = event;
+            }
+            event = next;
+        }
+        if (last) {
+            last->next = nullptr;
+        }
+        *head = first;
     }
 
     bool IsJournalUserEvent(const RE::InputEvent* event)
@@ -461,16 +539,85 @@ namespace
         output += '"';
     }
 
-    void AppendQuest(std::string& output, RE::TESQuest* quest, RE::PlayerCharacter* player, std::string_view currentDate)
+    // Tamrielic accepted/completed stamps persisted in the SKSE cosave. Quests finished
+    // before tracking existed have neither stamp and are treated as legacy entries.
+    struct QuestTimes
+    {
+        bool hasAccepted = false;
+        bool hasCompleted = false;
+        float acceptedDays = 0.0f;
+        float completedDays = 0.0f;
+        std::string acceptedDate;
+        std::string completedDate;
+    };
+
+    std::mutex questTimesMutex;
+    std::unordered_map<RE::FormID, QuestTimes> questTimes;
+
+    constexpr std::uint32_t MakeTag(char a, char b, char c, char d)
+    {
+        return (static_cast<std::uint32_t>(static_cast<unsigned char>(a)) << 24) |
+               (static_cast<std::uint32_t>(static_cast<unsigned char>(b)) << 16) |
+               (static_cast<std::uint32_t>(static_cast<unsigned char>(c)) << 8) |
+               static_cast<std::uint32_t>(static_cast<unsigned char>(d));
+    }
+
+    constexpr std::uint32_t kSerializationUID = MakeTag('A', 'J', 'N', 'L');
+    constexpr std::uint32_t kQuestTimesRecord = MakeTag('Q', 'T', 'M', 'S');
+    constexpr std::uint32_t kQuestTimesVersion = 1;
+    constexpr std::uint32_t kMaxStampLength = 256;
+
+    bool GetNowStamp(float& days, std::string& date)
+    {
+        const auto calendar = RE::Calendar::GetSingleton();
+        if (!calendar) {
+            return false;
+        }
+        char buffer[128]{};
+        calendar->GetTimeDateString(buffer, sizeof(buffer), true);
+        days = calendar->GetDaysPassed();
+        date = buffer;
+        return !date.empty();
+    }
+
+    std::optional<QuestTimes> GetQuestTimes(RE::FormID formID)
+    {
+        std::scoped_lock lock(questTimesMutex);
+        const auto it = questTimes.find(formID);
+        return it != questTimes.end() ? std::optional<QuestTimes>(it->second) : std::nullopt;
+    }
+
+    void AppendQuestTimes(std::string& output, const std::optional<QuestTimes>& times)
+    {
+        if (!times) {
+            return;
+        }
+        if (times->hasAccepted) {
+            output += ",\"acceptedDate\":";
+            AppendJsonString(output, times->acceptedDate);
+        }
+        if (times->hasCompleted) {
+            output += ",\"completedDate\":";
+            AppendJsonString(output, times->completedDate);
+        }
+    }
+
+    void AppendQuest(
+        std::string& output,
+        RE::TESQuest* quest,
+        RE::PlayerCharacter* player,
+        const std::optional<QuestTimes>& times,
+        std::size_t order)
     {
         output += "{\"id\":";
         AppendJsonString(output, std::format("{:08X}", quest->GetFormID()));
+        output += ",\"order\":";
+        output += std::to_string(order);
         output += ",\"tracked\":";
         output += quest->IsActive() ? "true" : "false";
         output += ",\"title\":";
         AppendJsonString(output, QuestName(quest));
-        output += ",\"date\":";
-        AppendJsonString(output, currentDate);
+        AppendQuestTimes(output, times);
         output += ",\"body\":";
         AppendQuestLog(output, quest, player);
         output += ",\"objectives\":[";
@@ -578,6 +725,203 @@ namespace
         return quest->IsRunning() && HasVisibleObjectiveForActive(quest);
     }
 
+    // Stamps first-seen (accepted) and completion times. `visible` skips the journal-visibility
+    // check when the caller has already performed it.
+    bool ReconcileQuestTimes(RE::TESQuest* quest, RE::PlayerCharacter* player, bool visible = false)
+    {
+        if (!quest) {
+            return false;
+        }
+
+        const auto formID = quest->GetFormID();
+        const bool completed = quest->IsCompleted();
+
+        if (completed) {
+            // Completed with no record: a legacy quest, deliberately left unstamped.
+            std::scoped_lock lock(questTimesMutex);
+            const auto it = questTimes.find(formID);
+            if (it == questTimes.end() || it->second.hasCompleted) {
+                return false;
+            }
+        }
+
+        if (!visible && !ShouldShowQuest(quest, player)) {
+            return false;
+        }
+
+        float days = 0.0f;
+        std::string date;
+        if (!GetNowStamp(days, date)) {
+            return false;
+        }
+
+        std::scoped_lock lock(questTimesMutex);
+        auto it = questTimes.find(formID);
+        if (completed) {
+            if (it == questTimes.end() || it->second.hasCompleted) {
+                return false;
+            }
+            it->second.hasCompleted = true;
+            it->second.completedDays = days;
+            it->second.completedDate = std::move(date);
+            return true;
+        }
+
+        if (it == questTimes.end()) {
+            QuestTimes times;
+            times.hasAccepted = true;
+            times.acceptedDays = days;
+            times.acceptedDate = std::move(date);
+            questTimes.emplace(formID, std::move(times));
+            return true;
+        }
+
+        // A repeatable quest running again is no longer completed.
+        if (it->second.hasCompleted) {
+            it->second.hasCompleted = false;
+            it->second.completedDate.clear();
+            it->second.completedDays = 0.0f;
+            return true;
+        }
+        return false;
+    }
+
+    void ReconcileAllQuestTimes()
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const auto dataHandler = RE::TESDataHandler::GetSingleton();
+        if (!player || !dataHandler) {
+            return;
+        }
+        for (const auto quest : dataHandler->GetFormArray<RE::TESQuest>()) {
+            if (quest && (quest->IsCompleted() || quest->IsRunning())) {
+                ReconcileQuestTimes(quest, player);
+            }
+        }
+    }
+
+    // Field notes live only in the cosave so they stay strictly per-save. questTimesMutex
+    // guards all cosave-backed state (quest times and notes).
+    std::vector<std::string> fieldNotes;
+
+    constexpr std::uint32_t kFieldNotesRecord = MakeTag('F', 'N', 'T', 'S');
+    constexpr std::uint32_t kFieldNotesVersion = 1;
+    constexpr std::uint32_t kMaxNoteLength = 1 << 16;
+    constexpr std::uint32_t kMaxNoteCount = 1024;
+
+    void WriteString(SKSE::SerializationInterface* intfc, const std::string& value, std::uint32_t maxLength)
+    {
+        const auto length = static_cast<std::uint32_t>(std::min<std::size_t>(value.size(), maxLength));
+        intfc->WriteRecordData(length);
+        if (length > 0) {
+            intfc->WriteRecordData(value.data(), length);
+        }
+    }
+
+    bool ReadString(SKSE::SerializationInterface* intfc, std::string& value, std::uint32_t maxLength)
+    {
+        std::uint32_t length = 0;
+        if (intfc->ReadRecordData(length) != sizeof(length) || length > maxLength) {
+            return false;
+        }
+        value.assign(length, '\0');
+        return length == 0 || intfc->ReadRecordData(value.data(), length) == length;
+    }
+
+    json SnapshotFieldNotes()
+    {
+        std::scoped_lock lock(questTimesMutex);
+        return json(fieldNotes);
+    }
+
+    void SaveCosave(SKSE::SerializationInterface* intfc)
+    {
+        std::scoped_lock lock(questTimesMutex);
+
+        if (intfc->OpenRecord(kQuestTimesRecord, kQuestTimesVersion)) {
+            intfc->WriteRecordData(static_cast<std::uint32_t>(questTimes.size()));
+            for (const auto& [formID, times] : questTimes) {
+                const std::uint32_t id = formID;
+                const std::uint8_t flags = (times.hasAccepted ? 1 : 0) | (times.hasCompleted ? 2 : 0);
+                intfc->WriteRecordData(id);
+                intfc->WriteRecordData(flags);
+                intfc->WriteRecordData(times.acceptedDays);
+                intfc->WriteRecordData(times.completedDays);
+                WriteString(intfc, times.acceptedDate, kMaxStampLength);
+                WriteString(intfc, times.completedDate, kMaxStampLength);
+            }
+        }
+
+        if (intfc->OpenRecord(kFieldNotesRecord, kFieldNotesVersion)) {
+            intfc->WriteRecordData(static_cast<std::uint32_t>(fieldNotes.size()));
+            for (const auto& note : fieldNotes) {
+                WriteString(intfc, note, kMaxNoteLength);
+            }
+        }
+    }
+
+    void LoadCosave(SKSE::SerializationInterface* intfc)
+    {
+        std::unordered_map<RE::FormID, QuestTimes> loadedTimes;
+        std::vector<std::string> loadedNotes;
+
+        std::uint32_t type = 0;
+        std::uint32_t version = 0;
+        std::uint32_t length = 0;
+        while (intfc->GetNextRecordInfo(type, version, length)) {
+            std::uint32_t count = 0;
+            if (type == kQuestTimesRecord && version == kQuestTimesVersion) {
+                if (intfc->ReadRecordData(count) != sizeof(count)) {
+                    continue;
+                }
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    std::uint32_t oldID = 0;
+                    std::uint8_t flags = 0;
+                    QuestTimes times;
+                    if (intfc->ReadRecordData(oldID) != sizeof(oldID) ||
+                        intfc->ReadRecordData(flags) != sizeof(flags) ||
+                        intfc->ReadRecordData(times.acceptedDays) != sizeof(float) ||
+                        intfc->ReadRecordData(times.completedDays) != sizeof(float) ||
+                        !ReadString(intfc, times.acceptedDate, kMaxStampLength) ||
+                        !ReadString(intfc, times.completedDate, kMaxStampLength)) {
+                        logger::warn("AdventurersJournal: truncated quest-times record");
+                        break;
+                    }
+                    times.hasAccepted = (flags & 1) != 0;
+                    times.hasCompleted = (flags & 2) != 0;
+
+                    RE::FormID newID = 0;
+                    if (intfc->ResolveFormID(oldID, newID)) {
+                        loadedTimes[newID] = std::move(times);
+                    }
+                }
+            } else if (type == kFieldNotesRecord && version == kFieldNotesVersion) {
+                if (intfc->ReadRecordData(count) != sizeof(count) || count > kMaxNoteCount) {
+                    continue;
+                }
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    std::string note;
+                    if (!ReadString(intfc, note, kMaxNoteLength)) {
+                        logger::warn("AdventurersJournal: truncated field-notes record");
+                        break;
+                    }
+                    loadedNotes.push_back(std::move(note));
+                }
+            }
+        }
+
+        std::scoped_lock lock(questTimesMutex);
+        questTimes = std::move(loadedTimes);
+        fieldNotes = std::move(loadedNotes);
+    }
+
+    void RevertCosave(SKSE::SerializationInterface*)
+    {
+        std::scoped_lock lock(questTimesMutex);
+        questTimes.clear();
+        fieldNotes.clear();
+    }
+
     std::string BuildJournalJson()
     {
         const auto player = RE::PlayerCharacter::GetSingleton();
@@ -603,39 +947,75 @@ namespace
 
         // kCompleted takes strict precedence. A completed quest with kRunning still set
         // (common for post-quest dialogue) goes only to completed, never to active.
-        output += ",\"active\":[";
-        bool firstActive = true;
+        std::vector<RE::TESQuest*> activeQuests;
+        std::vector<RE::TESQuest*> completedQuests;
         for (const auto quest : dataHandler->GetFormArray<RE::TESQuest>()) {
             if (!ShouldShowQuest(quest, player)) {
                 continue;
             }
+            ReconcileQuestTimes(quest, player, true);
             if (quest->IsCompleted()) {
-                continue;  // completed always goes to completed list only
+                completedQuests.push_back(quest);
+            } else if (quest->IsRunning()) {
+                activeQuests.push_back(quest);
             }
-            if (!quest->IsRunning() || quest->IsCompleted()) {
-                continue;
+        }
+
+        // Base order is kept in "order" so the UI can re-pin instantly when tracking changes.
+        std::unordered_map<RE::FormID, std::size_t> activeOrder;
+        for (std::size_t i = 0; i < activeQuests.size(); ++i) {
+            activeOrder[activeQuests[i]->GetFormID()] = i;
+        }
+        std::stable_partition(activeQuests.begin(), activeQuests.end(), [](RE::TESQuest* quest) {
+            return quest->IsActive();
+        });
+
+        // Newest completion first; quests without a completion stamp fall back to their
+        // accepted time, and fully legacy quests keep their existing order at the bottom.
+        std::unordered_map<RE::FormID, std::optional<QuestTimes>> completedTimes;
+        for (const auto quest : completedQuests) {
+            completedTimes[quest->GetFormID()] = GetQuestTimes(quest->GetFormID());
+        }
+        const auto sortKey = [&completedTimes](RE::TESQuest* quest) -> std::optional<float> {
+            const auto& times = completedTimes[quest->GetFormID()];
+            if (!times) {
+                return std::nullopt;
             }
+            if (times->hasCompleted) {
+                return times->completedDays;
+            }
+            if (times->hasAccepted) {
+                return times->acceptedDays;
+            }
+            return std::nullopt;
+        };
+        std::stable_sort(completedQuests.begin(), completedQuests.end(), [&sortKey](RE::TESQuest* a, RE::TESQuest* b) {
+            const auto keyA = sortKey(a);
+            const auto keyB = sortKey(b);
+            if (keyA.has_value() != keyB.has_value()) {
+                return keyA.has_value();
+            }
+            return keyA && keyB && *keyA > *keyB;
+        });
+
+        output += ",\"active\":[";
+        bool firstActive = true;
+        for (const auto quest : activeQuests) {
             if (!firstActive) {
                 output += ",";
             }
-            AppendQuest(output, quest, player, currentDate);
+            AppendQuest(output, quest, player, GetQuestTimes(quest->GetFormID()), activeOrder[quest->GetFormID()]);
             firstActive = false;
         }
 
         output += "],\"completed\":[";
-        bool firstCompleted = true;
-        for (const auto quest : dataHandler->GetFormArray<RE::TESQuest>()) {
-            if (!ShouldShowQuest(quest, player)) {
-                continue;
-            }
-            if (!quest->IsCompleted()) {
-                continue;
-            }
-            if (!firstCompleted) {
+        std::size_t completedIndex = 0;
+        for (const auto quest : completedQuests) {
+            if (completedIndex > 0) {
                 output += ",";
             }
-            AppendQuest(output, quest, player, currentDate);
-            firstCompleted = false;
+            AppendQuest(output, quest, player, completedTimes[quest->GetFormID()], completedIndex);
+            ++completedIndex;
         }
         output += "]}";
         return output;
@@ -650,12 +1030,18 @@ namespace
         }
         try {
             const auto data = json::parse(payload);
-            const auto userData = UserDataDirectory();
-            if (data.contains("fieldNotes")) {
-                AtomicWriteJson(userData / "field-notes.json", data.at("fieldNotes"));
+            if (data.contains("fieldNotes") && data.at("fieldNotes").is_array()) {
+                std::vector<std::string> notes;
+                for (const auto& note : data.at("fieldNotes")) {
+                    if (note.is_string() && notes.size() < kMaxNoteCount) {
+                        notes.push_back(note.get<std::string>());
+                    }
+                }
+                std::scoped_lock lock(questTimesMutex);
+                fieldNotes = std::move(notes);
             }
             if (data.contains("sketchMetadata")) {
-                AtomicWriteJson(userData / "sketch-metadata.json", data.at("sketchMetadata"));
+                AtomicWriteJson(UserDataDirectory() / "sketch-metadata.json", data.at("sketchMetadata"));
             }
         } catch (const json::exception& error) {
             logger::warn("AdventurersJournal: rejected user-data save: {}", error.what());
@@ -728,6 +1114,7 @@ namespace
         }
 
         isTyping = false;
+        SetTextInputActive(false);
         PlayJournalSound(kSoundClose);
         prismaUI->Invoke(journalView, "window.onJournalClose()");
         prismaUI->Unfocus(journalView);
@@ -774,6 +1161,7 @@ namespace
             RE::InputEvent* const* eventList,
             RE::BSTEventSource<RE::InputEvent*>*) override
         {
+            const auto wasOpen = journalOpen;
             for (auto event = eventList ? *eventList : nullptr; event; event = event->next) {
                 if (event->GetEventType() != RE::INPUT_EVENT_TYPE::kButton) {
                     continue;
@@ -790,17 +1178,29 @@ namespace
                     continue;
                 }
 
-                if (isTyping && isJournalInput && !isEscape) {
-                    continue;
+                if (journalOpen && isJournalInput && (isTyping || IsControlMapTextInputActive())) {
+                    break;
+                }
+
+                if (!journalOpen && !CanOpenJournal()) {
+                    return RE::BSEventNotifyControl::kContinue;
                 }
 
                 CloseVanillaJournal();
                 if (isEscape || journalOpen) {
                     CloseJournal();
-                } else if (!IsJournalBlocked()) {
+                } else {
                     OpenJournal();
                 }
                 return RE::BSEventNotifyControl::kStop;
+            }
+
+            // A text field is focused: keep keyboard input away from other mods' hotkeys.
+            if (wasOpen && journalOpen && isTyping && eventList && *eventList) {
+                StripKeyboardEvents(const_cast<RE::InputEvent**>(eventList));
+                if (!*eventList) {
+                    return RE::BSEventNotifyControl::kStop;
+                }
             }
 
             return RE::BSEventNotifyControl::kContinue;
@@ -809,26 +1209,67 @@ namespace
 
     JournalInputSink journalInputSink;
 
+    // Deferred one frame so objectives and the completed flag have settled before stamping.
+    void ReconcileQuestLater(RE::FormID formID)
+    {
+        const auto taskInterface = SKSE::GetTaskInterface();
+        if (!taskInterface) {
+            return;
+        }
+        taskInterface->AddTask([formID] {
+            if (const auto quest = RE::TESForm::LookupByID<RE::TESQuest>(formID)) {
+                ReconcileQuestTimes(quest, RE::PlayerCharacter::GetSingleton());
+            }
+            if (journalOpen) {
+                SendJournalData();
+            }
+        });
+    }
+
     // Push updated quest data whenever any quest stage advances.
     class QuestStageSink final : public RE::BSTEventSink<RE::TESQuestStageEvent>
     {
     public:
         RE::BSEventNotifyControl ProcessEvent(
-            const RE::TESQuestStageEvent*,
+            const RE::TESQuestStageEvent* event,
             RE::BSTEventSource<RE::TESQuestStageEvent>*) override
         {
-            if (journalOpen) {
-                SendJournalData();
+            if (event) {
+                ReconcileQuestLater(event->formID);
             }
             return RE::BSEventNotifyControl::kContinue;
         }
     };
 
     QuestStageSink questStageSink;
+
+    class QuestStartStopSink final : public RE::BSTEventSink<RE::TESQuestStartStopEvent>
+    {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(
+            const RE::TESQuestStartStopEvent* event,
+            RE::BSTEventSource<RE::TESQuestStartStopEvent>*) override
+        {
+            if (event) {
+                ReconcileQuestLater(event->formID);
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+
+    QuestStartStopSink questStartStopSink;
 }
 
 static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
 {
+    if (message && (message->type == SKSE::MessagingInterface::kPostLoadGame ||
+                    message->type == SKSE::MessagingInterface::kNewGame)) {
+        if (const auto taskInterface = SKSE::GetTaskInterface()) {
+            taskInterface->AddTask([] { ReconcileAllQuestTimes(); });
+        }
+        return;
+    }
+
     if (!message || message->type != SKSE::MessagingInterface::kDataLoaded) {
         return;
     }
@@ -856,7 +1297,8 @@ static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
         PlayJournalSound(kSoundPageTurn);
     });
     prismaUI->RegisterJSListener(journalView, "setTypingState", [](const char* state) {
-        isTyping = state && (std::strcmp(state, "true") == 0 || std::strcmp(state, "1") == 0);
+        isTyping = journalOpen && state && (std::strcmp(state, "true") == 0 || std::strcmp(state, "1") == 0);
+        SetTextInputActive(isTyping);
     });
     prismaUI->RegisterJSListener(journalView, "toggleQuestTracking", [](const char* formIDHex) {
         ToggleQuestTracking(formIDHex);
@@ -882,6 +1324,7 @@ static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
 
     if (const auto scriptEvents = RE::ScriptEventSourceHolder::GetSingleton()) {
         scriptEvents->AddEventSink<RE::TESQuestStageEvent>(&questStageSink);
+        scriptEvents->AddEventSink<RE::TESQuestStartStopEvent>(&questStartStopSink);
     } else {
         logger::critical("Failed to get ScriptEventSourceHolder. Quest stage sink was not registered.");
     }
@@ -899,6 +1342,14 @@ extern "C" DLLEXPORT bool SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
     }
 
     SKSE::Init(a_skse, { .trampoline = true, .trampolineSize = 1 << 10 });
+    if (const auto serialization = SKSE::GetSerializationInterface()) {
+        serialization->SetUniqueID(kSerializationUID);
+        serialization->SetSaveCallback(SaveCosave);
+        serialization->SetLoadCallback(LoadCosave);
+        serialization->SetRevertCallback(RevertCosave);
+    } else {
+        logger::critical("Serialization interface unavailable; quest dates will not persist.");
+    }
     messaging->RegisterListener("SKSE", SKSEMessageHandler);
     return true;
 }
