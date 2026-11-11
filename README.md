@@ -33,6 +33,41 @@ The build produces the plugin DLL and creates a distributable folder under
 their expected directory structure. `build/`, `.xmake/`, and `dist/` are local
 generated output and are not tracked.
 
+## Quest history
+
+Quest timestamps, completion ordering, tracked-quest snapshots, and field notes
+are stored in each save's SKSE cosave. Existing version 1 quest-time records
+are read when loading older saves. The journal only shows quests present in the
+loaded game's live quest data; it does not import quest history from shared
+user-data files. On initialization, visible existing active quests without an
+acceptance timestamp and completed quests without a completion timestamp are
+assigned the current in-game date. These approximate dates are saved in the
+cosave on the next save and are not the quests' actual historical dates.
+Portrait metadata remains shared in `UserData/sketch-metadata.json`.
+
+The Active Quests index groups tracked, main, guild, Civil War, side, mod, and
+miscellaneous quests. Category expansion preferences are shared across saves in
+`UserData/quest-categories.json`; Tracked resets to expanded whenever the journal
+opens. Quest details show the quest's underlying category.
+
+`Data/SKSE/Plugins/AdventurersJournal.ini` is created with defaults if missing.
+Edit it as UTF-8 before starting the game to customize category labels, pause
+the game while the journal is open, set the default Tasks & Errands expansion,
+or hide plugin names in Chronicles detail tags. An existing saved category
+preference takes precedence over the Tasks default. The INI and category
+preferences are shared across saves and do not alter save data.
+Keep your customized INI when installing an update; the release includes a
+default copy and the plugin never overwrites an existing INI on startup.
+
+Active quests can be hidden with Abandon Quest and restored from the dedicated
+Abandoned Quests index, accessible from Active Quests. Hidden quests are stored
+per save, excluded from both quest lists, and are untracked when abandoned;
+their underlying quest progress is unchanged.
+
+Active quest details include Find on Map. Ordinary objective rows remain
+read-only: Skyrim tracks these at quest level, and changing their displayed
+state can affect quest scripts.
+
 ## Credits and third-party software
 
 - **SKSE64** — Skyrim Script Extender, required for the native plugin.

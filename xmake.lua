@@ -4,7 +4,7 @@ set_xmakever("3.0.0")
 includes("lib/commonlibsse-ng")
 
 local PLUGIN_NAME = "AdventurersJournal"
-local PLUGIN_VERSION = "2.1.0-beta"
+local PLUGIN_VERSION = "2.5.0"
 
 local VIEW_NAME = "AdventurersJournal"
 
@@ -50,6 +50,7 @@ target(PLUGIN_NAME)
 
         os.cp(path.join(os.projectdir(), "view", "*"), viewdir)
         os.cp(target:targetfile(), plugindir)
+        os.cp(path.join(os.projectdir(), "AdventurersJournal.ini"), plugindir)
 
         local symbolfile = target:symbolfile()
         if symbolfile and os.isfile(symbolfile) then
