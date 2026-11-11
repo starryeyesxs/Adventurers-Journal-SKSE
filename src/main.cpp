@@ -1,5 +1,6 @@
 #include "PrismaUI_API.h"
 #include "quest_text.h"
+#include "quest_times.h"
 #include <RE/B/BGSRefAlias.h>
 #include <algorithm>
 #include <array>
@@ -30,8 +31,51 @@ namespace
     bool journalOpen = false;
     bool journalViewReady = false;
     bool isTyping = false;
+    bool journalPauseOwned = false;
     namespace fs = std::filesystem;
     using json = nlohmann::json;
+
+    struct JournalSettings
+    {
+        bool pauseGameWhenOpen = false;
+        bool collapseTasksByDefault = true;
+        bool showChroniclesPluginName = true;
+        json labels = {
+            { "tracked", "Tracked" }, { "main", "Main" }, { "companions", "The Companions" },
+            { "college", "College of Winterhold" }, { "thieves", "Thieves Guild" },
+            { "brotherhood", "Dark Brotherhood" }, { "civilWar", "Civil War" },
+            { "imperial", "Imperial Legion" }, { "stormcloaks", "Stormcloaks" },
+            { "side", "Side & Daedric" }, { "chronicles", "Chronicles" },
+            { "tasks", "Tasks & Errands" }
+        };
+    };
+    JournalSettings settings;
+
+    constexpr std::string_view kDefaultIni = "; Adventurer's Journal settings. In case you feel like adding a bit of your own flair to fit your playthrough " R"ini(
+; Boolean values are 0 (off) or 1 (on).
+[General]
+; Change value to 1 here in case you're scared and need the game to pause while checking journal
+bPauseGameWhenOpen=0
+; Open journal with Misc quests section collapsed by default. Change to 0 if you don't care.
+bCollapseTasksByDefault=1
+; Cronicles includes CC and modded content. Shows plugin name of quest. On by default.
+bShowChroniclesPluginName=1
+
+; You can change the name of any of the quest sorting headers here.
+[CategoryLabels]
+sTracked=Tracked
+sMain=Main
+sCompanions=The Companions
+sCollege=College of Winterhold
+sThievesGuild=Thieves Guild
+sDarkBrotherhood=Dark Brotherhood
+sCivilWarFallback=Civil War
+sImperialLegion=Imperial Legion
+sStormcloaks=Stormcloaks
+sSideAndDaedric=Side & Daedric
+sChronicles=Chronicles
+sTasksAndErrands=Tasks & Errands
+)ini";
 
     struct CachedScreenshot
     {
@@ -48,6 +92,7 @@ namespace
     constexpr RE::FormID kSoundOpen     = 0x00077C00;  // UIJournalOpen
     constexpr RE::FormID kSoundClose    = 0x00077C01;  // UIJournalClose
     constexpr RE::FormID kSoundPageTurn = 0x0007EA3C;  // ITMBookPageTurnForwardSD
+    constexpr RE::FormID kMiscellaneousQuestFormID = 0x00039F26;
 
     fs::path UserDataDirectory()
     {
@@ -58,6 +103,118 @@ namespace
         }
         const fs::path root(buffer, buffer + length);
         return root.parent_path() / "Data" / "SKSE" / "Plugins" / "AdventurersJournal" / "UserData";
+    }
+
+    std::string_view TrimIni(std::string_view value)
+    {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string_view::npos) {
+            return {};
+        }
+        return value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+    }
+
+    void LoadSettings()
+    {
+        const auto userDirectory = UserDataDirectory();
+        if (userDirectory.empty()) {
+            logger::error("AdventurersJournal: cannot determine INI directory");
+            return;
+        }
+        const auto path = userDirectory.parent_path().parent_path() / "AdventurersJournal.ini";
+        std::error_code error;
+        fs::create_directories(path.parent_path(), error);
+        if (error) {
+            logger::error("AdventurersJournal: cannot create INI directory: {}", error.message());
+            return;
+        }
+
+        const auto file = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+            CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            std::string defaultIni;
+            defaultIni.reserve(kDefaultIni.size() + std::count(kDefaultIni.begin(), kDefaultIni.end(), '\n'));
+            for (const char c : kDefaultIni) {
+                if (c == '\n') {
+                    defaultIni += '\r';
+                }
+                defaultIni += c;
+            }
+            DWORD written = 0;
+            const auto length = static_cast<DWORD>(defaultIni.size());
+            if (!::WriteFile(file, defaultIni.data(), length, &written, nullptr) || written != length) {
+                logger::error("AdventurersJournal: failed to write default INI (error {})", ::GetLastError());
+            }
+            ::CloseHandle(file);
+        } else if (::GetLastError() != ERROR_FILE_EXISTS) {
+            logger::error("AdventurersJournal: cannot create INI (error {})", ::GetLastError());
+        }
+
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            logger::error("AdventurersJournal: cannot read INI '{}'", path.string());
+            return;
+        }
+        static constexpr std::array labelKeys{
+            std::pair{ "sTracked", "tracked" }, std::pair{ "sMain", "main" },
+            std::pair{ "sCompanions", "companions" }, std::pair{ "sCollege", "college" },
+            std::pair{ "sThievesGuild", "thieves" }, std::pair{ "sDarkBrotherhood", "brotherhood" },
+            std::pair{ "sCivilWarFallback", "civilWar" }, std::pair{ "sImperialLegion", "imperial" },
+            std::pair{ "sStormcloaks", "stormcloaks" }, std::pair{ "sSideAndDaedric", "side" },
+            std::pair{ "sChronicles", "chronicles" }, std::pair{ "sTasksAndErrands", "tasks" }
+        };
+        std::string section;
+        std::string line;
+        bool firstLine = true;
+        while (std::getline(input, line)) {
+            std::string_view text(line);
+            if (firstLine && text.starts_with("\xEF\xBB\xBF")) {
+                text.remove_prefix(3);
+            }
+            firstLine = false;
+            text = TrimIni(text);
+            if (text.empty() || text.front() == ';' || text.front() == '#') {
+                continue;
+            }
+            if (text.front() == '[' && text.back() == ']') {
+                section = std::string(TrimIni(text.substr(1, text.size() - 2)));
+                continue;
+            }
+            const auto separator = text.find('=');
+            if (separator == std::string_view::npos) {
+                logger::warn("AdventurersJournal: ignoring malformed INI line '{}'", text);
+                continue;
+            }
+            const auto key = TrimIni(text.substr(0, separator));
+            const auto value = TrimIni(text.substr(separator + 1));
+            if (quest_text::EqualIgnoreCase(section, "General")) {
+                bool* setting = nullptr;
+                if (quest_text::EqualIgnoreCase(key, "bPauseGameWhenOpen")) setting = &settings.pauseGameWhenOpen;
+                else if (quest_text::EqualIgnoreCase(key, "bCollapseTasksByDefault")) setting = &settings.collapseTasksByDefault;
+                else if (quest_text::EqualIgnoreCase(key, "bShowChroniclesPluginName")) setting = &settings.showChroniclesPluginName;
+                if (setting) {
+                    if (value == "0" || value == "1") *setting = value == "1";
+                    else logger::warn("AdventurersJournal: invalid boolean INI setting '{}={}'", key, value);
+                }
+            } else if (quest_text::EqualIgnoreCase(section, "CategoryLabels")) {
+                for (const auto& [iniKey, jsonKey] : labelKeys) {
+                    if (quest_text::EqualIgnoreCase(key, iniKey)) {
+                        if (value.empty()) {
+                            logger::warn("AdventurersJournal: empty category label '{}'", key);
+                        } else if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                                       static_cast<int>(value.size()), nullptr, 0) == 0) {
+                            logger::warn("AdventurersJournal: invalid UTF-8 category label '{}'", key);
+                        } else {
+                            settings.labels[jsonKey] = std::string(value);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (input.bad()) {
+            logger::error("AdventurersJournal: error reading INI '{}'", path.string());
+        }
     }
 
     std::string FileUrl(const fs::path& path)
@@ -151,11 +308,19 @@ namespace
         }
 
         const auto metadataPath = UserDataDirectory() / "sketch-metadata.json";
+        const auto questCategoriesPath = UserDataDirectory() / "quest-categories.json";
         prismaUI->Invoke(journalView, ("window.loadNativeUserData(" + json{
             { "fieldNotes", SnapshotFieldNotes() },
             { "saveGeneration", saveGeneration.load() },
             { "sketchMetadata", ReadJson(metadataPath, json::object()) },
-            { "sketchMetadataExists", fs::exists(metadataPath) }
+            { "sketchMetadataExists", fs::exists(metadataPath) },
+            { "questCategories", ReadJson(questCategoriesPath, json::object()) },
+            { "settings", {
+                { "pauseGameWhenOpen", settings.pauseGameWhenOpen },
+                { "collapseTasksByDefault", settings.collapseTasksByDefault },
+                { "showChroniclesPluginName", settings.showChroniclesPluginName },
+                { "labels", settings.labels }
+            } }
         }.dump(-1, ' ', false, json::error_handler_t::replace) + ")").c_str());
     }
 
@@ -443,11 +608,8 @@ namespace
                     }
 
                     RE::TESObjectREFR* reference = nullptr;
-                    const auto refIt = quest->refAliasMap.find(alias->aliasID);
-                    if (refIt != quest->refAliasMap.end() && refIt->second) {
-                        const auto resolvedReference = refIt->second.get();
-                        reference = resolvedReference.get();
-                    }
+                    const auto resolvedReference = quest->GetAliasedRef(alias->aliasID).get();
+                    reference = resolvedReference.get();
 
                     if (!reference) {
                         const auto refAlias = dynamic_cast<RE::BGSRefAlias*>(alias);
@@ -460,6 +622,24 @@ namespace
                         } else if (const auto form = reference->GetObjectReference();
                                    form && form->GetName() && *form->GetName() != '\0') {
                             return std::string(form->GetName());
+                        }
+                    }
+
+                    for (const auto instance : quest->instanceData) {
+                        if (!instance || instance->id != quest->currentInstanceID) {
+                            continue;
+                        }
+                        for (const auto& savedName : instance->stringData) {
+                            if (savedName.aliasID != alias->aliasID || savedName.fullNameFormID == 0) {
+                                continue;
+                            }
+                            const auto savedForm = RE::TESForm::LookupByID(savedName.fullNameFormID);
+                            if (savedForm) {
+                                if (const auto savedDisplayName = savedForm->GetName();
+                                    savedDisplayName && *savedDisplayName != '\0') {
+                                    return std::string(savedDisplayName);
+                                }
+                            }
                         }
                     }
                     break;
@@ -514,24 +694,11 @@ namespace
         output += '"';
     }
 
-    // Tamrielic accepted/completed stamps persisted in the SKSE cosave. Quests finished
-    // before tracking existed have neither stamp and are treated as legacy entries.
-    struct QuestTimes
-    {
-        bool hasAccepted = false;
-        bool hasCompleted = false;
-        bool hasTracked = false;
-        bool tracked = false;
-        float acceptedDays = 0.0f;
-        float completedDays = 0.0f;
-        std::uint64_t completionOrder = 0;
-        std::string acceptedDate;
-        std::string completedDate;
-    };
-
+    // Tamrielic accepted/completed stamps persisted in the SKSE cosave.
     std::mutex questTimesMutex;
     std::unordered_map<RE::FormID, QuestTimes> questTimes;
     std::unordered_set<RE::FormID> observedActiveQuests;
+    std::unordered_set<RE::FormID> abandonedQuests;
     std::uint64_t nextCompletionOrder = 0;
 
     constexpr std::uint32_t MakeTag(char a, char b, char c, char d)
@@ -545,6 +712,8 @@ namespace
     constexpr std::uint32_t kSerializationUID = MakeTag('A', 'J', 'N', 'L');
     constexpr std::uint32_t kQuestTimesRecord = MakeTag('Q', 'T', 'M', 'S');
     constexpr std::uint32_t kQuestTimesVersion = 2;
+    constexpr std::uint32_t kAbandonedQuestsRecord = MakeTag('A', 'B', 'N', 'D');
+    constexpr std::uint32_t kAbandonedQuestsVersion = 1;
     constexpr std::uint32_t kMaxStampLength = 256;
 
     bool GetNowStamp(float& days, std::string& date)
@@ -595,6 +764,15 @@ namespace
         output += std::to_string(order);
         output += ",\"tracked\":";
         output += quest->IsActive() ? "true" : "false";
+        output += ",\"questType\":";
+        output += std::to_string(static_cast<unsigned>(quest->GetType()));
+        output += ",\"sourcePlugin\":";
+        if (const auto file = quest->GetFile(0)) {
+            AppendJsonString(output, file->GetFilename());
+        } else {
+            output += "null";
+            logger::warn("AdventurersJournal: quest 0x{:08X} has no source plugin", quest->GetFormID());
+        }
         output += ",\"title\":";
         AppendJsonString(output, QuestName(quest));
         AppendQuestTimes(output, times);
@@ -722,7 +900,6 @@ namespace
             if (!completionEvent) {
                 return false;
             }
-            // Completed with no record: a legacy quest, deliberately left unstamped.
             std::scoped_lock lock(questTimesMutex);
             const auto it = questTimes.find(formID);
             if (it == questTimes.end() || !it->second.hasAccepted || it->second.hasCompleted ||
@@ -788,7 +965,7 @@ namespace
         return false;
     }
 
-    void ReconcileAllQuestTimes()
+    void InitializeQuestTimes()
     {
         if (!saveReady.load()) {
             return;
@@ -796,10 +973,25 @@ namespace
         const auto player = RE::PlayerCharacter::GetSingleton();
         const auto dataHandler = RE::TESDataHandler::GetSingleton();
         if (!player || !dataHandler) {
+            logger::error("AdventurersJournal: cannot initialize quest timestamps without player and data handler");
             return;
         }
+        float days = 0.0f;
+        std::string date;
+        if (!GetNowStamp(days, date)) {
+            logger::error("AdventurersJournal: cannot initialize quest timestamps without an in-game date");
+            return;
+        }
+        const auto generation = saveGeneration.load();
         for (const auto quest : dataHandler->GetFormArray<RE::TESQuest>()) {
-            if (quest && (quest->IsCompleted() || quest->IsRunning())) {
+            if (ShouldShowQuest(quest, player)) {
+                {
+                    std::scoped_lock lock(questTimesMutex);
+                    if (!saveReady.load() || generation != saveGeneration.load()) {
+                        return;
+                    }
+                    BackfillQuestTime(questTimes[quest->GetFormID()], quest->IsCompleted(), days, date);
+                }
                 ReconcileQuestTimes(quest, player);
             }
         }
@@ -892,12 +1084,25 @@ namespace
         } else {
             logger::error("AdventurersJournal: failed to open field-notes record");
         }
+
+        if (intfc->OpenRecord(kAbandonedQuestsRecord, kAbandonedQuestsVersion)) {
+            bool success = intfc->WriteRecordData(static_cast<std::uint32_t>(abandonedQuests.size()));
+            for (const auto formID : abandonedQuests) {
+                success = success && intfc->WriteRecordData(formID);
+            }
+            if (!success) {
+                logger::error("AdventurersJournal: failed to write abandoned-quests record");
+            }
+        } else {
+            logger::error("AdventurersJournal: failed to open abandoned-quests record");
+        }
     }
 
     void LoadCosave(SKSE::SerializationInterface* intfc)
     {
         std::unordered_map<RE::FormID, QuestTimes> loadedTimes;
         std::vector<std::string> loadedNotes;
+        std::unordered_set<RE::FormID> loadedAbandonedQuests;
         std::uint64_t loadedCompletionOrder = 0;
 
         std::uint32_t type = 0;
@@ -950,7 +1155,26 @@ namespace
                     }
                     loadedNotes.push_back(std::move(note));
                 }
-            } else if (type == kQuestTimesRecord || type == kFieldNotesRecord) {
+            } else if (type == kAbandonedQuestsRecord && version == kAbandonedQuestsVersion) {
+                if (intfc->ReadRecordData(count) != sizeof(count) ||
+                    length < sizeof(count) || count > (length - sizeof(count)) / sizeof(RE::FormID)) {
+                    logger::warn("AdventurersJournal: invalid abandoned-quests record count");
+                    continue;
+                }
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    RE::FormID oldID = 0;
+                    if (intfc->ReadRecordData(oldID) != sizeof(oldID)) {
+                        logger::warn("AdventurersJournal: truncated abandoned-quests record");
+                        break;
+                    }
+                    RE::FormID newID = 0;
+                    if (intfc->ResolveFormID(oldID, newID)) {
+                        loadedAbandonedQuests.insert(newID);
+                    } else {
+                        logger::warn("AdventurersJournal: cannot resolve abandoned quest FormID 0x{:08X}", oldID);
+                    }
+                }
+            } else if (type == kQuestTimesRecord || type == kFieldNotesRecord || type == kAbandonedQuestsRecord) {
                 logger::warn("AdventurersJournal: unsupported cosave record version {} for type 0x{:08X}",
                     version, type);
             }
@@ -959,6 +1183,7 @@ namespace
         std::scoped_lock lock(questTimesMutex);
         questTimes = std::move(loadedTimes);
         fieldNotes = std::move(loadedNotes);
+        abandonedQuests = std::move(loadedAbandonedQuests);
         nextCompletionOrder = loadedCompletionOrder;
     }
 
@@ -967,8 +1192,41 @@ namespace
         std::scoped_lock lock(questTimesMutex);
         questTimes.clear();
         observedActiveQuests.clear();
+        abandonedQuests.clear();
         fieldNotes.clear();
         nextCompletionOrder = 0;
+    }
+
+    void SetQuestTracked(RE::TESQuest* quest, bool tracked, bool forceRepath = true)
+    {
+        if (!quest) {
+            return;
+        }
+
+        const bool activeChanged = quest->IsActive() != tracked;
+        if (activeChanged) {
+            quest->data.flags.set(tracked, RE::QuestFlag::kActive);
+            quest->AddChange(RE::TESQuest::ChangeFlags::kQuestFlags);
+        }
+
+        bool parentChanged = false;
+        if (tracked && quest->GetType() == RE::QUEST_DATA::Type::kMiscellaneous) {
+            const auto miscellaneousQuest = RE::TESForm::LookupByID<RE::TESQuest>(kMiscellaneousQuestFormID);
+            if (miscellaneousQuest && !miscellaneousQuest->IsActive()) {
+                miscellaneousQuest->data.flags.set(true, RE::QuestFlag::kActive);
+                miscellaneousQuest->AddChange(RE::TESQuest::ChangeFlags::kQuestFlags);
+                parentChanged = true;
+            } else if (!miscellaneousQuest) {
+                logger::error("AdventurersJournal: vanilla Miscellaneous parent quest 0x{:08X} was not found",
+                    kMiscellaneousQuestFormID);
+            }
+        }
+
+        if (forceRepath && (activeChanged || parentChanged)) {
+            if (const auto player = RE::PlayerCharacter::GetSingleton()) {
+                player->GetPlayerFlags().forceQuestTargetRepath = true;
+            }
+        }
     }
 
     void RevertCosave(SKSE::SerializationInterface*)
@@ -989,9 +1247,8 @@ namespace
                 continue;
             }
             const auto it = questTimes.find(quest->GetFormID());
-            if (it != questTimes.end() && it->second.hasTracked && quest->IsActive() != it->second.tracked) {
-                quest->data.flags.set(it->second.tracked, RE::QuestFlag::kActive);
-                quest->AddChange(RE::TESQuest::ChangeFlags::kQuestFlags);
+            if (it != questTimes.end() && it->second.hasTracked) {
+                SetQuestTracked(quest, it->second.tracked, false);
             }
         }
         if (const auto player = RE::PlayerCharacter::GetSingleton()) {
@@ -1024,6 +1281,20 @@ namespace
         AppendJsonString(output, characterName);
         output += ",\"date\":";
         AppendJsonString(output, currentDate);
+        const auto imperial = RE::TESForm::LookupByID<RE::TESFaction>(0x0002BF9A);
+        const auto stormcloaks = RE::TESForm::LookupByID<RE::TESFaction>(0x0002BF9B);
+        if (!imperial || !stormcloaks) {
+            logger::warn("AdventurersJournal: could not resolve Civil War factions");
+        }
+        output += ",\"civilWarAllegiance\":";
+        AppendJsonString(output, imperial && player->IsInFaction(imperial) ? "imperial" :
+            stormcloaks && player->IsInFaction(stormcloaks) ? "stormcloaks" : "none");
+
+        std::unordered_set<RE::FormID> hiddenQuests;
+        {
+            std::scoped_lock lock(questTimesMutex);
+            hiddenQuests = abandonedQuests;
+        }
 
         // kCompleted takes strict precedence. A completed quest with kRunning still set
         // (common for post-quest dialogue) goes only to completed, never to active.
@@ -1034,6 +1305,9 @@ namespace
                 continue;
             }
             ReconcileQuestTimes(quest, player, true);
+            if (hiddenQuests.contains(quest->GetFormID())) {
+                continue;
+            }
             if (quest->IsCompleted()) {
                 completedQuests.push_back(quest);
             } else if (quest->IsRunning()) {
@@ -1104,11 +1378,67 @@ namespace
             AppendQuest(output, quest, player, completedTimes[quest->GetFormID()], completedIndex);
             ++completedIndex;
         }
+        output += "],\"abandonedQuests\":[";
+        std::vector<RE::TESQuest*> hiddenQuestList;
+        for (const auto formID : hiddenQuests) {
+            if (auto* quest = RE::TESForm::LookupByID<RE::TESQuest>(formID)) {
+                hiddenQuestList.push_back(quest);
+            } else {
+                logger::warn("AdventurersJournal: abandoned quest 0x{:08X} not found", formID);
+            }
+        }
+        std::sort(hiddenQuestList.begin(), hiddenQuestList.end(), [](const auto* a, const auto* b) {
+            const auto comparison = std::strcmp(QuestName(a), QuestName(b));
+            return comparison != 0 ? comparison < 0 : a->GetFormID() < b->GetFormID();
+        });
+        for (std::size_t i = 0; i < hiddenQuestList.size(); ++i) {
+            if (i > 0) {
+                output += ",";
+            }
+            output += "{\"id\":";
+            AppendJsonString(output, std::format("{:08X}", hiddenQuestList[i]->GetFormID()));
+            output += ",\"title\":";
+            AppendJsonString(output, QuestName(hiddenQuestList[i]));
+            output += "}";
+        }
         output += "]}";
         return output;
     }
 
     void SendJournalData();
+
+    void SaveQuestCategories(const char* payload)
+    {
+        if (!payload) {
+            logger::warn("AdventurersJournal: missing quest category preferences");
+            return;
+        }
+        try {
+            const auto data = json::parse(payload);
+            if (!data.is_object()) {
+                logger::warn("AdventurersJournal: invalid quest category preferences");
+                return;
+            }
+            static constexpr std::array keys{
+                "main", "companions", "college", "thieves", "brotherhood",
+                "civilWar", "side", "chronicles", "tasks"
+            };
+            json preferences = json::object();
+            for (const auto key : keys) {
+                const auto it = data.find(key);
+                if (it != data.end()) {
+                    if (!it->is_boolean()) {
+                        logger::warn("AdventurersJournal: invalid quest category preference '{}'", key);
+                        return;
+                    }
+                    preferences[key] = *it;
+                }
+            }
+            AtomicWriteJson(UserDataDirectory() / "quest-categories.json", preferences);
+        } catch (const json::exception& error) {
+            logger::warn("AdventurersJournal: rejected quest category preferences: {}", error.what());
+        }
+    }
 
     void SaveJournalUserData(const char* payload)
     {
@@ -1159,25 +1489,45 @@ namespace
         }
     }
 
-    void ToggleQuestTracking(const char* payload)
+    struct QuestRequest
+    {
+        RE::FormID formID;
+        std::uint64_t generation;
+    };
+
+    std::optional<QuestRequest> ReadQuestRequest(const char* payload)
     {
         const auto request = ReadTrackingRequest(payload);
         if (!request || !request->contains("id") || !request->at("id").is_string()) {
             if (request) {
                 logger::warn("AdventurersJournal: missing quest FormID in tracking request");
             }
-            return;
+            return std::nullopt;
         }
         const auto formIDHex = request->at("id").get<std::string>();
         const auto generation = request->at("saveGeneration").get<std::uint64_t>();
         if (!saveReady.load() || generation != saveGeneration.load()) {
             logger::warn("AdventurersJournal: ignored quest tracking request from an inactive save");
-            return;
+            return std::nullopt;
         }
         if (formIDHex.size() != 8 || !std::all_of(formIDHex.begin(), formIDHex.end(), [](unsigned char ch) {
                 return std::isxdigit(ch) != 0;
             })) {
             logger::warn("AdventurersJournal: invalid quest FormID in tracking request");
+            return std::nullopt;
+        }
+        const RE::FormID formID = static_cast<RE::FormID>(std::strtoul(formIDHex.c_str(), nullptr, 16));
+        if (formID == 0) {
+            logger::warn("AdventurersJournal: invalid zero quest FormID");
+            return std::nullopt;
+        }
+        return QuestRequest{ formID, generation };
+    }
+
+    void ToggleQuestTracking(const char* payload)
+    {
+        const auto request = ReadQuestRequest(payload);
+        if (!request) {
             return;
         }
         const auto taskInterface = SKSE::GetTaskInterface();
@@ -1185,11 +1535,7 @@ namespace
             logger::warn("ToggleQuestTracking: task interface unavailable");
             return;
         }
-        const RE::FormID formID = static_cast<RE::FormID>(std::strtoul(formIDHex.c_str(), nullptr, 16));
-        if (formID == 0) {
-            logger::warn("ToggleQuestTracking: invalid zero quest FormID");
-            return;
-        }
+        const auto [formID, generation] = *request;
         taskInterface->AddTask([formID, generation] {
             if (!saveReady.load() || generation != saveGeneration.load()) {
                 return;
@@ -1200,12 +1546,55 @@ namespace
                 return;
             }
             const bool nowActive = !quest->IsActive();
-            quest->data.flags.set(nowActive, RE::QuestFlag::kActive);
-            quest->AddChange(RE::TESQuest::ChangeFlags::kQuestFlags);
-            if (const auto player = RE::PlayerCharacter::GetSingleton()) {
-                player->GetPlayerFlags().forceQuestTargetRepath = true;
-            }
+            SetQuestTracked(quest, nowActive);
             logger::info("ToggleQuestTracking: quest '{}' 0x{:08X} tracked={}", quest->GetFullName(), formID, nowActive);
+            SendJournalData();
+        });
+    }
+
+    void SetQuestAbandoned(const char* payload, bool abandon)
+    {
+        const auto request = ReadQuestRequest(payload);
+        if (!request) {
+            return;
+        }
+        const auto taskInterface = SKSE::GetTaskInterface();
+        if (!taskInterface) {
+            logger::warn("AdventurersJournal: task interface unavailable for abandoned quest request");
+            return;
+        }
+        const auto [formID, generation] = *request;
+        taskInterface->AddTask([formID, generation, abandon] {
+            if (!saveReady.load() || generation != saveGeneration.load()) {
+                logger::warn("AdventurersJournal: ignored abandoned quest request from an inactive save");
+                return;
+            }
+            auto* quest = RE::TESForm::LookupByID<RE::TESQuest>(formID);
+            if (!quest || (abandon && (!quest->IsRunning() || quest->IsCompleted()))) {
+                logger::warn("AdventurersJournal: cannot {} quest 0x{:08X}",
+                    abandon ? "abandon" : "restore", formID);
+                return;
+            }
+            {
+                std::scoped_lock lock(questTimesMutex);
+                if (!saveReady.load() || generation != saveGeneration.load()) {
+                    logger::warn("AdventurersJournal: save changed during abandoned quest request");
+                    return;
+                }
+                if (abandon) {
+                    const auto it = questTimes.find(formID);
+                    const bool savedTracked = it != questTimes.end() && it->second.hasTracked && it->second.tracked;
+                    if (quest->IsActive() || savedTracked) {
+                        SetQuestTracked(quest, false);
+                    }
+                    auto& times = questTimes[formID];
+                    times.hasTracked = true;
+                    times.tracked = false;
+                    abandonedQuests.insert(formID);
+                } else {
+                    abandonedQuests.erase(formID);
+                }
+            }
             SendJournalData();
         });
     }
@@ -1250,17 +1639,135 @@ namespace
 
     void CloseJournal()
     {
-        if (!journalOpen || !prismaUI) {
+        if (!journalOpen) {
             return;
         }
 
+        if (journalPauseOwned) {
+            if (const auto ui = RE::UI::GetSingleton()) {
+                if (ui->numPausesGame > 0) {
+                    --ui->numPausesGame;
+                } else {
+                    logger::error("AdventurersJournal: owned pause count was already zero");
+                }
+            } else {
+                logger::error("AdventurersJournal: UI unavailable while releasing journal pause");
+            }
+            journalPauseOwned = false;
+        }
         isTyping = false;
         SetTextInputActive(false);
         PlayJournalSound(kSoundClose);
-        prismaUI->Invoke(journalView, "window.onJournalClose()");
-        prismaUI->Unfocus(journalView);
-        prismaUI->Hide(journalView);
+        if (prismaUI) {
+            prismaUI->Invoke(journalView, "window.onJournalClose()");
+            prismaUI->Unfocus(journalView);
+            prismaUI->Hide(journalView);
+        }
         journalOpen = false;
+    }
+
+    void ReportQuestMapError(const char* message)
+    {
+        logger::warn("AdventurersJournal: {}", message);
+        if (journalViewReady && prismaUI && prismaUI->IsValid(journalView)) {
+            prismaUI->Invoke(journalView, ("window.showQuestMapError(" + json(message).dump() + ")").c_str());
+        }
+    }
+
+    RE::ObjectRefHandle ResolveQuestMapTarget(RE::TESQuestTarget* questTarget, const RE::TESQuest* quest)
+    {
+        RE::ObjectRefHandle destination;
+        questTarget->GetTargetRef(destination, true, quest);
+        if (!destination.get()) {
+            return {};
+        }
+
+        using MapTrackingRef = RE::ObjectRefHandle& (*)(RE::ObjectRefHandle&, RE::ObjectRefHandle&,
+            const RE::TeleportPath*, std::uint32_t, bool);
+        static REL::Relocation<MapTrackingRef> getMapTrackingRef{ RELOCATION_ID(52183, 53075) };
+        constexpr std::uint32_t worldMapScope = 0;
+        RE::ObjectRefHandle mapTarget;
+        getMapTrackingRef(mapTarget, destination, &questTarget->teleportPath, worldMapScope, true);
+        return mapTarget.get() ? mapTarget : RE::ObjectRefHandle{};
+    }
+
+    void FindQuestOnMap(const char* payload)
+    {
+        const auto request = ReadQuestRequest(payload);
+        if (!request) {
+            ReportQuestMapError("Unable to find this quest on the map.");
+            return;
+        }
+        const auto tasks = SKSE::GetTaskInterface();
+        if (!tasks) {
+            ReportQuestMapError("Unable to open the map right now.");
+            return;
+        }
+        const auto [formID, generation] = *request;
+        tasks->AddTask([formID, generation] {
+            if (!saveReady.load() || generation != saveGeneration.load() || !journalOpen) {
+                logger::warn("AdventurersJournal: ignored stale find-on-map request");
+                return;
+            }
+            auto* quest = RE::TESForm::LookupByID<RE::TESQuest>(formID);
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!quest || !player || !quest->IsRunning() || quest->IsCompleted()) {
+                ReportQuestMapError("This quest is no longer active.");
+                return;
+            }
+            if (REL::Module::IsVR()) {
+                ReportQuestMapError("Finding quest targets on the map is not supported on Skyrim VR.");
+                return;
+            }
+            {
+                std::scoped_lock lock(questTimesMutex);
+                if (abandonedQuests.contains(formID)) {
+                    ReportQuestMapError("This quest has been abandoned.");
+                    return;
+                }
+            }
+
+            RE::ObjectRefHandle target;
+            for (const auto objective : quest->objectives) {
+                if (!objective || objective->state.get() != RE::QUEST_OBJECTIVE_STATE::kDisplayed) {
+                    continue;
+                }
+                for (std::uint32_t i = 0; objective->targets && i < objective->numTargets; ++i) {
+                    const auto questTarget = objective->targets[i];
+                    if (!questTarget || !questTarget->conditions.IsTrue(player, nullptr)) {
+                        continue;
+                    }
+                    target = ResolveQuestMapTarget(questTarget, quest);
+                    if (target) {
+                        break;
+                    }
+                }
+                if (target) {
+                    break;
+                }
+            }
+            if (!target) {
+                ReportQuestMapError("No map target is available for this quest.");
+                return;
+            }
+
+            const auto queue = RE::UIMessageQueue::GetSingleton();
+            const auto manager = RE::MessageDataFactoryManager::GetSingleton();
+            const auto creator = manager ? manager->GetCreator<RE::RefHandleUIData>(RE::RefHandleUIData::CLASS_NAME) : nullptr;
+            if (!queue || !creator) {
+                ReportQuestMapError("Unable to open the map right now.");
+                return;
+            }
+            auto* data = creator->Create();
+            if (!data) {
+                ReportQuestMapError("Unable to open the map right now.");
+                return;
+            }
+            data->data = target.native_handle();
+            SetQuestTracked(quest, true);
+            CloseJournal();
+            queue->AddMessage(RE::BSFixedString(RE::MapMenu::MENU_NAME), RE::UI_MESSAGE_TYPE::kShow, data);
+        });
     }
 
     void SendJournalData()
@@ -1287,6 +1794,14 @@ namespace
         }
 
         journalOpen = true;
+        if (settings.pauseGameWhenOpen) {
+            if (const auto ui = RE::UI::GetSingleton()) {
+                ++ui->numPausesGame;
+                journalPauseOwned = true;
+            } else {
+                logger::error("AdventurersJournal: cannot pause; UI is unavailable");
+            }
+        }
         prismaUI->SetOrder(journalView, 1000);
         logger::info("Adventurer's Journal focus state: {}", prismaUI->HasFocus(journalView));
         PlayJournalSound(kSoundOpen);
@@ -1419,8 +1934,8 @@ static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
         saveReady.store(false);
         ++saveGeneration;
         ClearSaveState();
+        CloseJournal();
         if (journalViewReady && prismaUI && prismaUI->IsValid(journalView)) {
-            CloseJournal();
             prismaUI->Invoke(journalView, "window.resetJournalSaveState()");
         }
         if (message->type == SKSE::MessagingInterface::kPreLoadGame) {
@@ -1441,16 +1956,7 @@ static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
     }
 
     if (message->type != SKSE::MessagingInterface::kDataLoaded) {
-        if (const auto taskInterface = SKSE::GetTaskInterface()) {
-            const auto generation = saveGeneration.load();
-            taskInterface->AddTask([generation] {
-                if (saveReady.load() && generation == saveGeneration.load()) {
-                    ReconcileAllQuestTimes();
-                }
-            });
-        } else {
-            logger::warn("AdventurersJournal: cannot reconcile quest timestamps; task interface unavailable");
-        }
+        InitializeQuestTimes();
         return;
     }
 
@@ -1471,7 +1977,11 @@ static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
     prismaUI->Hide(journalView);
 
     prismaUI->RegisterJSListener(journalView, "requestJournalClose", [](const char*) {
-        CloseJournal();
+        if (const auto tasks = SKSE::GetTaskInterface()) {
+            tasks->AddTask([] { CloseJournal(); });
+        } else {
+            logger::error("AdventurersJournal: cannot close journal; task interface is unavailable");
+        }
     });
     prismaUI->RegisterJSListener(journalView, "playJournalSound", [](const char*) {
         PlayJournalSound(kSoundPageTurn);
@@ -1486,6 +1996,15 @@ static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
     prismaUI->RegisterJSListener(journalView, "clearAllQuestTracking", [](const char* payload) {
         ClearAllQuestTracking(payload);
     });
+    prismaUI->RegisterJSListener(journalView, "abandonQuest", [](const char* payload) {
+        SetQuestAbandoned(payload, true);
+    });
+    prismaUI->RegisterJSListener(journalView, "restoreQuest", [](const char* payload) {
+        SetQuestAbandoned(payload, false);
+    });
+    prismaUI->RegisterJSListener(journalView, "findQuestOnMap", [](const char* payload) {
+        FindQuestOnMap(payload);
+    });
     prismaUI->RegisterJSListener(journalView, "requestJournalUserData", [](const char*) {
         SendJournalUserData();
     });
@@ -1494,6 +2013,9 @@ static void SKSEMessageHandler(SKSE::MessagingInterface::Message* message)
     });
     prismaUI->RegisterJSListener(journalView, "saveJournalUserData", [](const char* payload) {
         SaveJournalUserData(payload);
+    });
+    prismaUI->RegisterJSListener(journalView, "saveQuestCategories", [](const char* payload) {
+        SaveQuestCategories(payload);
     });
 
     if (const auto inputManager = RE::BSInputDeviceManager::GetSingleton()) {
@@ -1522,6 +2044,7 @@ extern "C" DLLEXPORT bool SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
     }
 
     SKSE::Init(a_skse, { .trampoline = true, .trampolineSize = 1 << 10 });
+    LoadSettings();
     if (const auto serialization = SKSE::GetSerializationInterface()) {
         serialization->SetUniqueID(kSerializationUID);
         serialization->SetSaveCallback(SaveCosave);
