@@ -8,12 +8,13 @@ let journalData = {
   characterName: 'The last dragonborn',
   date: 'Date unknown',
   active: [],
-  completed: []
+  completed: [],
+  abandonedQuests: []
 };
 
 // ── State ──
 let currentTab = 'active';        // 'active' | 'completed' | 'notes' | 'sketches'
-let currentView = 'list';          // 'list' | 'detail' | 'notes' | 'notes-detail' | 'sketches' | 'sketch-detail'
+let currentView = 'list';          // 'list' | 'abandoned' | 'detail' | 'notes' | 'notes-detail' | 'sketches' | 'sketch-detail'
 let currentQuest = null;
 let currentSpreadPage = 0;         // which page of 16-per-spread we're on
 let currentSketchIndex = 0;
@@ -22,11 +23,27 @@ let portraitInspectionOpen = false;
 let fieldNotes = [];
 let currentNoteIndex = -1;
 let saveGeneration = 0;
+let confirmAbandon = false;
+let activeSpreadPage = 0;
+let activePages = [[]];
+let categoryPreferences = { tasks: false };
+let savedCategoryPreferences = {};
+let trackedExpanded = true;
+let journalSettings = { collapseTasksByDefault: true, showChroniclesPluginName: true, labels: {} };
 
-const QUESTS_PER_SPREAD = 16;
-const QUESTS_PER_PAGE   = 8;      // 8 left + 8 right = 16 per spread
+const QUESTS_PER_PAGE   = 8;
 const SKETCHES_PER_PAGE = 4;
 const SKETCHES_PER_SPREAD = 8;
+const QUESTS_PER_SPREAD = QUESTS_PER_PAGE * 2;
+const CATEGORY_DEFINITIONS = [
+  ['tracked', 'Tracked'], ['main', 'Main'], ['companions', 'The Companions'],
+  ['college', 'College of Winterhold'], ['thieves', 'Thieves Guild'],
+  ['brotherhood', 'Dark Brotherhood'], ['civilWar', 'Civil War'],
+  ['side', 'Side & Daedric'], ['chronicles', 'Chronicles'], ['tasks', 'Tasks & Errands']
+];
+const OFFICIAL_PLUGINS = new Set([
+  'skyrim.esm', 'update.esm', 'dawnguard.esm', 'hearthfires.esm', 'dragonborn.esm'
+]);
 
 // ── Sound bridge (DO NOT MODIFY) ──
 function triggerSkyrimSound(soundType) {
@@ -58,6 +75,8 @@ const el = {
   listTitleRight:         document.getElementById('list-title-right'),
   questCount:             document.getElementById('quest-count'),
   untrackAllBtn:          document.getElementById('untrack-all-btn'),
+  abandonedToggle:        document.getElementById('abandoned-toggle'),
+  abandonedBack:          document.getElementById('abandoned-back'),
   questCountRight:        document.getElementById('quest-count-right'),
   questListLeft:          document.getElementById('quest-list-left'),
   questListRight:         document.getElementById('quest-list-right'),
@@ -66,9 +85,13 @@ const el = {
   // Quest detail
   detailEyebrow:          document.getElementById('detail-eyebrow'),
   entryTitle:             document.getElementById('entry-title'),
+  entryCategory:          document.getElementById('entry-category'),
   entryDate:              document.getElementById('entry-date'),
   entryBody:              document.getElementById('entry-body'),
   trackBtn:               document.getElementById('track-btn'),
+  findOnMapBtn:           document.getElementById('find-on-map-btn'),
+  questActionError:       document.getElementById('quest-action-error'),
+  abandonBtn:             document.getElementById('abandon-btn'),
   trackSeal:              document.getElementById('track-seal'),
   trackLabel:             document.getElementById('track-label'),
   objectivesTitle:        document.getElementById('objectives-title'),
@@ -167,8 +190,10 @@ function updateNavButtons() {
     return;
   }
   if (currentTab === 'active' || currentTab === 'completed') {
-    const quests = journalData[currentTab] || [];
-    const totalSpreads = Math.max(1, Math.ceil(quests.length / QUESTS_PER_SPREAD));
+    const quests = journalData[currentView === 'abandoned' ? 'abandonedQuests' : currentTab] || [];
+    const totalSpreads = currentTab === 'active' && currentView === 'list'
+      ? Math.max(1, Math.ceil(activePages.length / 2))
+      : Math.max(1, Math.ceil(quests.length / QUESTS_PER_SPREAD));
     el.previousPage.classList.toggle('hidden', currentSpreadPage === 0);
     el.nextPage.classList.toggle('hidden', currentSpreadPage >= totalSpreads - 1);
     return;
@@ -199,34 +224,179 @@ function sortActiveQuests() {
     ((a.order ?? 0) - (b.order ?? 0)));
 }
 
+function originCategory(quest) {
+  if (typeof quest.sourcePlugin === 'string' && quest.sourcePlugin &&
+      !OFFICIAL_PLUGINS.has(quest.sourcePlugin.toLowerCase())) return 'chronicles';
+  switch (quest.questType) {
+    case 1: return 'main';
+    case 2: return 'college';
+    case 3: return 'thieves';
+    case 4: return 'brotherhood';
+    case 5: return 'companions';
+    case 6: return 'tasks';
+    case 9: return 'civilWar';
+    default: return 'side';
+  }
+}
+
+function activeCategory(quest) {
+  return quest.tracked ? 'tracked' : originCategory(quest);
+}
+
+function categoryLabel(key, label) {
+  const labels = journalSettings.labels;
+  if (key === 'civilWar') {
+    if (journalData.civilWarAllegiance === 'imperial') return labels.imperial || 'Imperial Legion';
+    if (journalData.civilWarAllegiance === 'stormcloaks') return labels.stormcloaks || 'Stormcloaks';
+  }
+  return labels[key] || label;
+}
+
+function isCategoryExpanded(key) {
+  return key === 'tracked' ? trackedExpanded : categoryPreferences[key] !== false;
+}
+
+function buildActiveRows(quests) {
+  const grouped = new Map(CATEGORY_DEFINITIONS.map(([key]) => [key, []]));
+  quests.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0)).forEach(quest => {
+    grouped.get(activeCategory(quest)).push(quest);
+  });
+  const rows = [];
+  CATEGORY_DEFINITIONS.forEach(([key, defaultLabel]) => {
+    const entries = grouped.get(key);
+    if (!entries.length) return;
+    const header = { kind: 'header', key, label: categoryLabel(key, defaultLabel), count: entries.length };
+    rows.push(header);
+    if (isCategoryExpanded(key)) {
+      entries.forEach(quest => rows.push({ kind: 'quest', key, quest, header }));
+    }
+  });
+  return rows;
+}
+
+function makeActiveRow(row) {
+  const li = document.createElement('li');
+  if (row.kind === 'header') {
+    li.className = 'quest-category';
+    const header = document.createElement('button');
+    header.className = 'quest-category-label';
+    header.textContent = `${isCategoryExpanded(row.key) ? '▾ ' : '▸ '}${row.label} (${row.count})`;
+    header.type = 'button';
+    header.setAttribute('aria-expanded', String(isCategoryExpanded(row.key)));
+    header.addEventListener('click', () => {
+      if (row.key === 'tracked') {
+        trackedExpanded = !trackedExpanded;
+      } else {
+        categoryPreferences[row.key] = categoryPreferences[row.key] === false;
+        savedCategoryPreferences[row.key] = categoryPreferences[row.key];
+        if (typeof window.saveQuestCategories === 'function') {
+          window.saveQuestCategories(JSON.stringify(savedCategoryPreferences));
+        } else {
+          console.error('Unable to persist quest category preferences: native bridge unavailable');
+        }
+      }
+      triggerSkyrimSound('focus');
+      renderQuestListSpread('active', currentSpreadPage);
+    });
+    li.appendChild(header);
+    return li;
+  }
+  li.className = `quest-item${row.quest.tracked ? ' tracked pinned' : ''}`;
+  li.innerHTML = `<span class="quest-main"><span class="quest-title">${escapeHtml(row.quest.title || 'Untitled')}</span></span>` +
+    '<span class="quest-mark"></span>';
+  li.addEventListener('click', () => {
+    triggerSkyrimSound('focus');
+    openQuestDetail(row.quest);
+  });
+  return li;
+}
+
+function activePageCapacity(list) {
+  const sample = makeActiveRow({ kind: 'header', key: 'tracked', label: 'Tracked', count: 1 });
+  list.appendChild(sample);
+  const height = sample.getBoundingClientRect ? sample.getBoundingClientRect().height : 0;
+  const available = list.clientHeight || 0;
+  list.innerHTML = '';
+  if (!height || !available) return QUESTS_PER_PAGE;
+  const gap = typeof getComputedStyle === 'function' ? parseFloat(getComputedStyle(list).rowGap) || 0 : 0;
+  return Math.max(1, Math.floor((available + gap) / (height + gap)));
+}
+
+function paginateActiveRows(rows, capacities) {
+  const pages = [];
+  let index = 0;
+  while (index < rows.length) {
+    const capacity = capacities[pages.length % 2];
+    const page = [];
+    if (rows[index].kind === 'quest' && capacity > 1) page.push(rows[index].header);
+    while (index < rows.length && page.length < capacity) {
+      // Keep an expanded section heading with its first quest when possible.
+      if (rows[index].kind === 'header' && rows[index + 1]?.kind === 'quest' &&
+          rows[index + 1].key === rows[index].key && capacity > 1 &&
+          page.length === capacity - 1) break;
+      page.push(rows[index++]);
+    }
+    pages.push(page);
+  }
+  return pages.length ? pages : [[]];
+}
+
+function renderActiveIndex(quests) {
+  el.questListLeft.classList.add('active-quest-list');
+  el.questListRight.classList.add('active-quest-list');
+  el.listTitleRight.textContent = quests.length ? 'Active Quests (cont.)' : '\u00A0';
+  el.questListLeft.innerHTML = '';
+  el.questListRight.innerHTML = '';
+  const capacities = [activePageCapacity(el.questListLeft), activePageCapacity(el.questListRight)];
+  activePages = paginateActiveRows(buildActiveRows(quests), capacities);
+  currentSpreadPage = Math.min(currentSpreadPage, Math.max(0, Math.ceil(activePages.length / 2) - 1));
+  el.listTitleRight.textContent = activePages.length > 1 ? 'Active Quests (cont.)' : '\u00A0';
+  (activePages[currentSpreadPage * 2] || []).forEach(row => el.questListLeft.appendChild(makeActiveRow(row)));
+  (activePages[currentSpreadPage * 2 + 1] || []).forEach(row => el.questListRight.appendChild(makeActiveRow(row)));
+}
+
 function formatDateLine(quest) {
   const parts = [];
   if (quest.acceptedDate)  parts.push(`Accepted ${quest.acceptedDate}`);
-  parts.push(quest.completedDate ? `Completed ${quest.completedDate}` : 'No date recorded');
+  if (quest.completedDate) parts.push(`Completed ${quest.completedDate}`);
   return parts.join(' · ');
 }
 
 function renderQuestListSpread(category, spreadPage) {
-  currentView = 'list';
+  const isAbandoned = category === 'abandonedQuests';
+  currentView = isAbandoned ? 'abandoned' : 'list';
+  confirmAbandon = false;
   currentSpreadPage = spreadPage;
   showSpread('spread-quest-list', 'spread-quest-list-right');
 
   const quests = Array.isArray(journalData[category]) ? journalData[category] : [];
-  const label  = category === 'active' ? 'Active Quests' : 'Completed Quests';
+  const label = isAbandoned ? 'Abandoned Quests' : category === 'active' ? 'Active Quests' : 'Completed Quests';
   el.listTitle.textContent      = label;
-  el.listTitleRight.textContent = quests.length > QUESTS_PER_PAGE ? label + ' (cont.)' : '\u00A0';
   el.questCount.textContent     = quests.length;
   el.questCountRight.textContent = '';
   el.characterName.textContent  = journalData.characterName || 'The last dragonborn';
   el.untrackAllBtn.classList.toggle('hidden', category !== 'active');
   el.untrackAllBtn.disabled = category !== 'active' || !quests.some(quest => quest.tracked);
-
-  const start = spreadPage * QUESTS_PER_SPREAD;
-  const pageQuests = quests.slice(start, start + QUESTS_PER_SPREAD);
-  const leftQuests  = pageQuests.slice(0, QUESTS_PER_PAGE);
-  const rightQuests = pageQuests.slice(QUESTS_PER_PAGE);
+  el.abandonedToggle.classList.toggle('hidden', category !== 'active' || journalData.abandonedQuests.length === 0);
+  el.abandonedToggle.textContent = `Abandoned (${journalData.abandonedQuests.length})`;
+  el.abandonedBack.classList.toggle('hidden', !isAbandoned);
 
   el.emptyState.classList.toggle('hidden', quests.length > 0);
+  if (category === 'active') {
+    renderActiveIndex(quests);
+    updateNavButtons();
+    return;
+  }
+  el.questListLeft.classList.remove('active-quest-list');
+  el.questListRight.classList.remove('active-quest-list');
+  const leftCapacity = QUESTS_PER_PAGE;
+  const spreadCapacity = QUESTS_PER_SPREAD;
+  currentSpreadPage = Math.min(spreadPage, Math.max(0, Math.ceil(quests.length / spreadCapacity) - 1));
+  el.listTitleRight.textContent = quests.length > leftCapacity ? label + ' (cont.)' : '\u00A0';
+  const start = currentSpreadPage * spreadCapacity;
+  const pageQuests = quests.slice(start, start + spreadCapacity);
+  const leftQuests  = pageQuests.slice(0, leftCapacity);
+  const rightQuests = pageQuests.slice(leftCapacity);
 
   el.questListLeft.innerHTML  = '';
   el.questListRight.innerHTML = '';
@@ -234,12 +404,29 @@ function renderQuestListSpread(category, spreadPage) {
   const globalOffset = start;
   function buildItem(quest, idx) {
     const li = document.createElement('li');
+    if (isAbandoned) {
+      li.className = 'quest-item abandoned-item';
+      const title = document.createElement('span');
+      title.className = 'quest-title';
+      title.textContent = quest.title || 'Untitled';
+      title.title = title.textContent;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'quiet-quest-btn';
+      button.textContent = 'Restore';
+      button.addEventListener('click', () => {
+        if (!saveGeneration || typeof window.restoreQuest !== 'function') return;
+        window.restoreQuest(JSON.stringify({ id: quest.id, saveGeneration }));
+      });
+      li.append(title, button);
+      return li;
+    }
     const globalIdx = globalOffset + idx;
     const classes = ['quest-item'];
     if (quest.tracked) classes.push('tracked');
     if (category === 'active') {
       if (quest.tracked) classes.push('pinned');
-      else if (globalIdx > 0 && quests[globalIdx - 1].tracked && idx % QUESTS_PER_PAGE !== 0) classes.push('pin-divider');
+      else if (globalIdx > 0 && quests[globalIdx - 1].tracked && idx !== 0 && idx !== leftCapacity) classes.push('pin-divider');
     }
     const dateLine = category === 'completed' ? formatDateLine(quest) : '';
     if (dateLine) classes.push('has-dates');
@@ -255,7 +442,7 @@ function renderQuestListSpread(category, spreadPage) {
   }
 
   leftQuests.forEach((q, i)  => el.questListLeft.appendChild(buildItem(q, i)));
-  rightQuests.forEach((q, i) => el.questListRight.appendChild(buildItem(q, QUESTS_PER_PAGE + i)));
+  rightQuests.forEach((q, i) => el.questListRight.appendChild(buildItem(q, leftCapacity + i)));
 
   updateNavButtons();
 }
@@ -264,20 +451,24 @@ function renderQuestListSpread(category, spreadPage) {
 //  QUEST DETAIL SPREAD
 // ══════════════════════════════════════════════════════════════
 function openQuestDetail(quest) {
+  if (currentView !== 'detail' || !currentQuest || currentQuest.id !== quest.id) confirmAbandon = false;
+  el.questActionError.classList.add('hidden');
   currentQuest = quest;
   currentView = 'detail';
   showSpread('spread-quest-detail-left', 'spread-quest-detail-right');
 
   el.detailEyebrow.textContent   = currentTab === 'completed' ? 'Completed Quest' : 'Active Quest';
   el.entryTitle.textContent      = quest.title || 'Untitled';
+  const origin = originCategory(quest);
+  const defaultLabel = CATEGORY_DEFINITIONS.find(([key]) => key === origin)[1];
+  const plugin = origin === 'chronicles' && journalSettings.showChroniclesPluginName && quest.sourcePlugin
+    ? ` · ${quest.sourcePlugin}` : '';
+  el.entryCategory.textContent = categoryLabel(origin, defaultLabel) + plugin;
   el.objectivesTitle.textContent = 'OBJECTIVES';
   el.entryDate.innerHTML         = '';
   const detailDates = [];
   if (quest.acceptedDate) detailDates.push(['Accepted', quest.acceptedDate]);
-  if (currentTab === 'completed') detailDates.push(['Completed', quest.completedDate || 'No date recorded']);
-  if (detailDates.length === 0 && currentTab !== 'completed') {
-    detailDates.push(['Accepted', 'No date recorded']);
-  }
+  if (currentTab === 'completed' && quest.completedDate) detailDates.push(['Completed', quest.completedDate]);
   detailDates.forEach(([label, value]) => {
     const line = document.createElement('span');
     line.className = 'entry-date-line';
@@ -309,6 +500,9 @@ function openQuestDetail(quest) {
 
   // Track button
   el.trackBtn.classList.toggle('hidden', currentTab !== 'active');
+  el.findOnMapBtn.classList.toggle('hidden', currentTab !== 'active');
+  el.abandonBtn.classList.toggle('hidden', currentTab !== 'active');
+  el.abandonBtn.textContent = confirmAbandon ? 'Confirm Abandon?' : 'Abandon Quest';
   renderTrackButton(quest);
 
   updateNavButtons();
@@ -712,7 +906,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (currentTab === 'notes') {
         renderFieldNotesSpread();
       } else {
-        renderQuestListSpread(currentTab, currentSpreadPage);
+        renderQuestListSpread(currentView === 'abandoned' ? 'abandonedQuests' : currentTab, currentSpreadPage);
       }
     }
   });
@@ -735,12 +929,14 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       return;
     }
-    const quests = journalData[currentTab] || [];
-    const totalSpreads = Math.ceil(quests.length / QUESTS_PER_SPREAD);
+    const category = currentView === 'abandoned' ? 'abandonedQuests' : currentTab;
+    const quests = journalData[category] || [];
+    const totalSpreads = category === 'active' ? Math.ceil(activePages.length / 2) :
+      Math.ceil(quests.length / QUESTS_PER_SPREAD);
     if (currentSpreadPage < totalSpreads - 1) {
       currentSpreadPage++;
       triggerSkyrimSound('focus');
-      renderQuestListSpread(currentTab, currentSpreadPage);
+      renderQuestListSpread(category, currentSpreadPage);
     }
   });
 
@@ -749,11 +945,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!['active', 'completed', 'notes', 'sketches'].includes(currentTab) ||
         currentView === 'detail' || currentView === 'notes-detail' || currentView === 'sketch-detail') return;
     e.preventDefault();
+    const category = currentView === 'abandoned' ? 'abandonedQuests' : currentTab;
     const itemCount = currentTab === 'notes' ? fieldNotes.length :
-      currentTab === 'sketches' ? sketches.length : (journalData[currentTab] || []).length;
+      currentTab === 'sketches' ? sketches.length : (journalData[category] || []).length;
     const itemsPerSpread = currentTab === 'notes' ? NOTES_PER_PAGE * 2 :
       currentTab === 'sketches' ? SKETCHES_PER_SPREAD : QUESTS_PER_SPREAD;
-    const totalSpreads = Math.max(1, Math.ceil(itemCount / itemsPerSpread));
+    const totalSpreads = currentTab === 'active' && currentView === 'list'
+      ? Math.max(1, Math.ceil(activePages.length / 2))
+      : Math.max(1, Math.ceil(itemCount / itemsPerSpread));
     const spreadPage = currentTab === 'sketches' ? currentSketchSpreadPage : currentSpreadPage;
     if (e.deltaY > 0 && spreadPage < totalSpreads - 1) {
       if (currentTab === 'sketches') currentSketchSpreadPage++;
@@ -761,14 +960,14 @@ document.addEventListener('DOMContentLoaded', () => {
       triggerSkyrimSound('focus');
       if (currentTab === 'notes') renderFieldNotesSpread();
       else if (currentTab === 'sketches') renderSketchGallery();
-      else renderQuestListSpread(currentTab, currentSpreadPage);
+      else renderQuestListSpread(category, currentSpreadPage);
     } else if (e.deltaY < 0 && spreadPage > 0) {
       if (currentTab === 'sketches') currentSketchSpreadPage--;
       else currentSpreadPage--;
       triggerSkyrimSound('focus');
       if (currentTab === 'notes') renderFieldNotesSpread();
       else if (currentTab === 'sketches') renderSketchGallery();
-      else renderQuestListSpread(currentTab, currentSpreadPage);
+      else renderQuestListSpread(category, currentSpreadPage);
     }
   }, { passive: false });
 
@@ -784,6 +983,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  el.findOnMapBtn.addEventListener('click', () => {
+    if (currentTab !== 'active' || currentView !== 'detail' || !currentQuest || !saveGeneration) return;
+    el.questActionError.classList.add('hidden');
+    if (typeof window.findQuestOnMap !== 'function') {
+      window.showQuestMapError('Unable to open the map right now.');
+      return;
+    }
+    window.findQuestOnMap(JSON.stringify({ id: currentQuest.id, saveGeneration }));
+  });
+
   el.untrackAllBtn.addEventListener('click', () => {
     if (!saveGeneration || !journalData.active.some(quest => quest.tracked)) return;
     journalData.active.forEach(quest => { quest.tracked = false; });
@@ -792,6 +1001,31 @@ document.addEventListener('DOMContentLoaded', () => {
     if (typeof window.clearAllQuestTracking === 'function') {
       window.clearAllQuestTracking(JSON.stringify({ saveGeneration }));
     }
+  });
+
+  el.abandonBtn.addEventListener('click', () => {
+    if (currentTab !== 'active' || currentView !== 'detail' || !currentQuest || !saveGeneration) return;
+    if (!confirmAbandon) {
+      confirmAbandon = true;
+      el.abandonBtn.textContent = 'Confirm Abandon?';
+      return;
+    }
+    if (typeof window.abandonQuest !== 'function') return;
+    window.abandonQuest(JSON.stringify({ id: currentQuest.id, saveGeneration }));
+    currentQuest = null;
+    renderQuestListSpread('active', 0);
+  });
+
+  el.abandonedToggle.addEventListener('click', () => {
+    if (currentTab !== 'active' || currentView !== 'list' || journalData.abandonedQuests.length === 0) return;
+    activeSpreadPage = currentSpreadPage;
+    triggerSkyrimSound('focus');
+    renderQuestListSpread('abandonedQuests', 0);
+  });
+  el.abandonedBack.addEventListener('click', () => {
+    if (currentView !== 'abandoned') return;
+    triggerSkyrimSound('focus');
+    renderQuestListSpread('active', activeSpreadPage);
   });
 
   // Typing state bridge
@@ -813,6 +1047,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Initial render
   renderQuestListSpread('active', 0);
+  if (typeof ResizeObserver !== 'undefined') {
+    let previousSize = '';
+    const observer = new ResizeObserver(entries => {
+      const size = entries.map(entry => `${entry.contentRect.width}:${entry.contentRect.height}`).join('|');
+      if (size === previousSize) return;
+      previousSize = size;
+      if (currentTab === 'active' && currentView === 'list') renderQuestListSpread('active', currentSpreadPage);
+    });
+    observer.observe(el.spreadQuestList);
+    observer.observe(el.spreadQuestListRight);
+  }
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => {
+      if (currentTab === 'active' && currentView === 'list') renderQuestListSpread('active', currentSpreadPage);
+    });
+  }
   renderSketchGallery();
   if (typeof window.requestJournalUserData === 'function') window.requestJournalUserData();
 });
@@ -822,11 +1072,22 @@ document.addEventListener('DOMContentLoaded', () => {
 // ══════════════════════════════════════════════════════════════
 
 window.onJournalOpen  = () => {
+  trackedExpanded = true;
+  if (currentTab === 'active' && currentView === 'list') renderQuestListSpread('active', currentSpreadPage);
   if (typeof window.requestJournalUserData === 'function') {
     window.requestJournalUserData();
   }
 };  // sound played by C++
-window.onJournalClose = () => { flushSketchMetadataSave(); };  // sound played by C++
+window.onJournalClose = () => {
+  flushSketchMetadataSave();
+  confirmAbandon = false;
+  el.abandonBtn.textContent = 'Abandon Quest';
+};  // sound played by C++
+
+window.showQuestMapError = (message) => {
+  el.questActionError.textContent = message;
+  el.questActionError.classList.remove('hidden');
+};
 
 // C++ pushes fresh quest data via this function every time the journal opens
 // or a quest stage event fires.
@@ -837,8 +1098,10 @@ window.updateJournalFromSkyrim = (incomingJsonData) => {
     journalData = {
       characterName: parsed.characterName || 'The last dragonborn',
       date:          parsed.date          || 'Date unknown',
+      civilWarAllegiance: parsed.civilWarAllegiance || 'none',
       active:    (Array.isArray(parsed.active)    ? parsed.active    : []).map(q => ({ ...q, tracked: q.tracked === true })),
-      completed: (Array.isArray(parsed.completed) ? parsed.completed : []).map(q => ({ ...q, tracked: q.tracked === true }))
+      completed: (Array.isArray(parsed.completed) ? parsed.completed : []).map(q => ({ ...q, tracked: q.tracked === true })),
+      abandonedQuests: Array.isArray(parsed.abandonedQuests) ? parsed.abandonedQuests : []
     };
 
     el.characterName.textContent = journalData.characterName;
@@ -846,7 +1109,9 @@ window.updateJournalFromSkyrim = (incomingJsonData) => {
     renderFieldNotes();
 
     if (currentTab === 'active' || currentTab === 'completed') {
-      if (currentView === 'list') {
+      if (currentView === 'abandoned') {
+        renderQuestListSpread('abandonedQuests', currentSpreadPage);
+      } else if (currentView === 'list') {
         renderQuestListSpread(currentTab, currentSpreadPage);
       } else if (currentView === 'detail' && currentQuest) {
         const all = [...journalData.active, ...journalData.completed];
@@ -866,6 +1131,26 @@ window.updateJournalFromSkyrim = (incomingJsonData) => {
 
 window.loadNativeUserData = (data) => {
   const parsed = data || {};
+  const config = parsed.settings || {};
+  journalSettings = {
+    collapseTasksByDefault: typeof config.collapseTasksByDefault === 'boolean' ? config.collapseTasksByDefault : true,
+    showChroniclesPluginName: typeof config.showChroniclesPluginName === 'boolean' ? config.showChroniclesPluginName : true,
+    labels: config.labels && typeof config.labels === 'object' && !Array.isArray(config.labels) ? config.labels : {}
+  };
+  const savedCategories = parsed.questCategories;
+  const preferences = { tasks: !journalSettings.collapseTasksByDefault };
+  savedCategoryPreferences = {};
+  if (savedCategories && typeof savedCategories === 'object' && !Array.isArray(savedCategories)) {
+    CATEGORY_DEFINITIONS.forEach(([key]) => {
+      if (key !== 'tracked' && typeof savedCategories[key] === 'boolean') {
+        preferences[key] = savedCategories[key];
+        savedCategoryPreferences[key] = savedCategories[key];
+      }
+    });
+  }
+  categoryPreferences = preferences;
+  if (currentTab === 'active' && currentView === 'list') renderQuestListSpread('active', currentSpreadPage);
+  else if (currentView === 'detail' && currentQuest) openQuestDetail(currentQuest);
   saveGeneration = parsed.saveGeneration;
   fieldNotes = Array.isArray(parsed.fieldNotes) ? parsed.fieldNotes.filter(note => typeof note === 'string') : [];
   if (parsed.sketchMetadataExists && parsed.sketchMetadata) {
@@ -885,6 +1170,8 @@ window.resetJournalSaveState = () => {
   currentTab = 'active';
   currentView = 'list';
   currentSpreadPage = 0;
+  confirmAbandon = false;
+  activeSpreadPage = 0;
   el.notes.value = '';
   window.updateJournalFromSkyrim({ active: [], completed: [] });
 };
@@ -928,6 +1215,10 @@ function applySketchMetadata(sketch) {
 // Escape key closes journal via C++
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !e.target.matches('input, textarea')) {
+    if (currentView === 'abandoned') {
+      renderQuestListSpread('active', activeSpreadPage);
+      return;
+    }
     if (currentView === 'detail' && (currentTab === 'active' || currentTab === 'completed')) {
       currentView = 'list';
       renderQuestListSpread(currentTab, currentSpreadPage);

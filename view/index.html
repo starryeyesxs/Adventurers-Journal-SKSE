@@ -59,12 +59,15 @@
           <div class="divider"></div>
           <ul id="quest-list-left" class="quest-list"></ul>
           <p class="empty-state hidden" id="empty-state">No entries recorded.</p>
+          <button class="quiet-quest-btn hidden" id="abandoned-toggle" type="button"></button>
+          <button class="quiet-quest-btn hidden" id="abandoned-back" type="button">Back to Active</button>
         </div>
 
         <!-- Quest detail spread — left page shows narrative -->
         <div id="spread-quest-detail-left" class="spread-panel hidden">
           <p class="eyebrow" id="detail-eyebrow">Quest Log</p>
           <h2 class="entry-title" id="entry-title">—</h2>
+          <p class="entry-category" id="entry-category"></p>
           <p class="entry-date" id="entry-date"></p>
           <div class="divider"></div>
           <p class="entry-body" id="entry-body"></p>
@@ -73,6 +76,9 @@
             <span class="track-seal" id="track-seal">⬟</span>
             <span class="track-label" id="track-label">Track Quest</span>
           </button>
+          <button class="quiet-quest-btn" id="find-on-map-btn" type="button">Find on Map</button>
+          <p class="quest-action-error hidden" id="quest-action-error" role="status"></p>
+          <button class="quiet-quest-btn abandon-btn" id="abandon-btn" type="button">Abandon Quest</button>
         </div>
 
         <!-- Field Notes index — left page (list of note titles) -->
